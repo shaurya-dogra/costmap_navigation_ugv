@@ -110,6 +110,7 @@ class CoreCfg:
     plane_iters: int = 150          # RANSAC hypotheses per frame
     plane_max_pts: int = 4000       # subsample candidates to this many
     plane_max_pitch_deg: float = 60.0   # steeper than this is a wall, not ground
+    plane_max_roll_deg: float = 45.0    # no rig rolls more than this; beyond it the fit is a wall
     plane_min_height: float = 0.03
     plane_max_height: float = 5.0
     plane_ema: float = 0.5          # blend of new estimate per frame
@@ -409,6 +410,8 @@ class GroundPlaneEstimator:
         # and the camera must be at a sane height.
         max_p = math.radians(cfg.plane_max_pitch_deg)
         up_ok = (-n[:, 1]) >= math.cos(max_p)
+        roll_ok = np.abs(np.arctan2(n[:, 0], -n[:, 1])) <= math.radians(cfg.plane_max_roll_deg)
+        up_ok &= roll_ok
         h_ok = (d >= cfg.plane_min_height) & (d <= cfg.plane_max_height)
         keep = up_ok & h_ok
         if not keep.any():
@@ -460,8 +463,9 @@ class GroundPlaneEstimator:
             n, d = _orient_up(n, d)
 
         conf = float(mask.mean())
-        pitch, _ = angles_from_normal(n)
+        pitch, roll = angles_from_normal(n)
         if (abs(pitch) > math.radians(cfg.plane_max_pitch_deg)
+                or abs(roll) > math.radians(cfg.plane_max_roll_deg)
                 or not (cfg.plane_min_height <= d <= cfg.plane_max_height)):
             return self._hold("refined plane implausible", n_cand)
 

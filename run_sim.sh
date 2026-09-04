@@ -14,6 +14,9 @@ cd "$(dirname "$0")"
 # autonomy additions); SLAM3D_DIR can point at a separate checkout instead
 SLAM3D_DIR="${SLAM3D_DIR:-$([[ -d sim3d ]] && echo sim3d || echo ../SLAM3D)}"
 PORT="${PORT:-8790}"
+# pick the next free port if the default is busy (e.g. a sim server still running)
+port_busy() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+while port_busy "$PORT"; do echo "port $PORT busy, trying $((PORT+1))"; PORT=$((PORT+1)); done
 VITE_PORT="${VITE_PORT:-5173}"
 DEPTH="sim"
 EXTRA=()

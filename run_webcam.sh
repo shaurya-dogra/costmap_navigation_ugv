@@ -13,16 +13,19 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PORT="${PORT:-8790}"
-ARGS=(--source 0 --rig macbook --depth metric --profile --port "$PORT")
-if [[ $# -gt 0 ]]; then
-  # user flags override / extend the defaults (argparse takes the last value)
-  ARGS+=("$@")
-fi
+# pick the next free port if the default is busy (e.g. a sim server still running)
+port_busy() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+while port_busy "$PORT"; do echo "port $PORT busy, trying $((PORT+1))"; PORT=$((PORT+1)); done
 
 if [[ ! -d .venv ]]; then
   echo "no .venv - run ./setup_mac.sh first"; exit 1
 fi
 
+ARGS=(--source 0 --rig macbook --depth metric --profile --port "$PORT")
+if [[ $# -gt 0 ]]; then
+  # user flags override / extend the defaults (argparse takes the last value)
+  ARGS+=("$@")
+fi
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 echo "perception server  ->  http://localhost:$PORT"
 echo "  ${ARGS[*]}"
@@ -30,7 +33,11 @@ echo "  ${ARGS[*]}"
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null || true' EXIT INT TERM
 
-for _ in $(seq 1 60); do curl -s "localhost:$PORT/status" >/dev/null && break; sleep 2; done
+echo "loading models (first run downloads Depth Anything, ~100 MB)..."
+for _ in $(seq 1 90); do
+  kill -0 $SERVER 2>/dev/null || { echo "server exited - see the error above (camera permission? try: --source 1)"; exit 1; }
+  curl -s "localhost:$PORT/status" >/dev/null && break; sleep 2
+done
 echo; echo "dashboard  http://localhost:$PORT   (Ctrl-C stops)"
 command -v open >/dev/null && open "http://localhost:$PORT" || true
 wait $SERVER

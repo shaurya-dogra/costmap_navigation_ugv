@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traversability Costmap</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --fg:#e6e8ee; --dim:#8b93a7; --ok:#4ade80; --warn:#f59e0b; --bad:#f87171; --acc:#38bdf8; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
+  .pill { padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--dim); }
+  .pill.on { border-color:var(--ok); color:var(--ok); }
+  .pill.off { border-color:var(--bad); color:var(--bad); }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:10px; padding:10px 16px; }
+  @media (max-width:1100px){ main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
+  .panel h2 { margin:0; padding:6px 10px; font-size:12px; font-weight:600; color:var(--dim); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; }
+  .panel img, .panel canvas { display:block; width:100%; height:auto; background:#000; image-rendering:pixelated; }
+  .panel .body { padding:8px 10px; }
+  .status { font-size:20px; font-weight:700; }
+  .status.DRIVING{color:var(--ok)} .status.ARRIVED{color:var(--acc)} .status.BLOCKED,.status.STOPPED,.status.ERROR{color:var(--bad)} .status.TURNING,.status.PLANNING{color:var(--warn)} .status.NO_GOAL{color:var(--dim)}
+  table { border-collapse:collapse; width:100%; }
+  td { padding:2px 6px 2px 0; vertical-align:top; }
+  td:first-child { color:var(--dim); white-space:nowrap; width:40%; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:8px 10px; border-top:1px solid var(--line); }
+  input, select, button { background:#0f1115; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; font:inherit; }
+  input[type=number]{ width:80px; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); color:#04121a; border-color:var(--acc); font-weight:600; }
+  .warn { color:var(--warn); } .bad { color:var(--bad); } .ok { color:var(--ok); } .dim { color:var(--dim); }
+  .hint { color:var(--dim); font-size:12px; padding:4px 10px 8px; }
+  .clickable { cursor:crosshair; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Perception AI · traversability costmap</h1>
+  <span id="conn" class="pill off">disconnected</span>
+  <span id="src" class="pill">source: –</span>
+  <span id="fps" class="pill">– fps</span>
+  <span id="depthpill" class="pill">depth: –</span>
+  <span id="modepill" class="pill" hidden>mode: –</span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2><span>Camera · semantics overlay</span><span id="camsize" class="dim"></span></h2>
+    <img id="camera" alt="camera">
+  </section>
+  <section class="panel">
+    <h2><span>Depth (Turbo: red near, blue far, black none)</span><span id="depthkind" class="dim"></span></h2>
+    <img id="depth" alt="depth">
+  </section>
+  <section class="panel">
+    <h2><span>Local costmap · robot frame (forward = up)</span><span id="gridinfo" class="dim"></span></h2>
+    <img id="costmap" class="clickable" alt="costmap" title="click to set a goal (robot frame)">
+    <div class="hint" id="localhint">Green free · yellow rough · magenta lethal · grey unknown. Click to set a local goal.</div>
+  </section>
+  <section class="panel" id="globalpanel">
+    <h2><span>Global costmap · world frame (north up)</span><span id="globalinfo" class="dim"></span></h2>
+    <img id="global" class="clickable" alt="global map" title="click to set the goal (world)">
+    <div class="hint">Accumulated from every frame via the robot pose. Click anywhere to set the destination.</div>
+  </section>
+
+  <section class="panel">
+    <h2><span>Navigation</span></h2>
+    <div class="body">
+      <div id="status" class="status NO_GOAL">–</div>
+      <div id="note" class="dim"></div>
+      <table>
+        <tr><td>command</td><td id="cmd">–</td></tr>
+        <tr><td>goal</td><td id="goal">–</td></tr>
+        <tr><td>distance to goal</td><td id="dist">–</td></tr>
+        <tr><td>pose (world)</td><td id="pose">–</td></tr>
+        <tr><td>frame</td><td id="seq">–</td></tr>
+      </table>
+    </div>
+    <div class="controls">
+      <span id="goalframe" class="dim">goal (world m)</span>
+      <input id="gx" type="number" step="0.5" placeholder="x">
+      <input id="gy" type="number" step="0.5" placeholder="y">
+      <button class="primary" onclick="setGoalFromInputs()">Set goal</button>
+      <button onclick="send({type:'clear_goal'})">Clear</button>
+      <button id="autobtn" hidden onclick="toggleAuto()">AUTO</button>
+      <button onclick="send({type:'reset'})">Reset map</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span>Ground plane (measured every frame)</span><span id="planesrc" class="dim"></span></h2>
+    <div class="body">
+      <table>
+        <tr><td>camera height</td><td id="ph">–</td></tr>
+        <tr><td>pitch (nose-down +)</td><td id="pp">–</td></tr>
+        <tr><td>roll (right-down +)</td><td id="pr">–</td></tr>
+        <tr><td>confidence</td><td id="pc">–</td></tr>
+        <tr><td>vs. mount</td><td id="pm">–</td></tr>
+        <tr><td>warnings</td><td id="warn" class="warn">–</td></tr>
+        <tr><td>profile (ms)</td><td id="prof" class="dim">–</td></tr>
+      </table>
+    </div>
+    <div class="controls">
+      <label>depth <select id="depthsel" onchange="send({type:'set_depth', mode:this.value})"></select></label>
+      <label>obstacle_h <input id="obs" type="number" step="0.05" onchange="param('obstacle_h', this.value)"></label>
+      <label>ditch_h <input id="ditch" type="number" step="0.05" onchange="param('ditch_h', this.value)"></label>
+      <label>robot_radius <input id="rr" type="number" step="0.05" onchange="param('robot_radius', this.value)"></label>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const wsUrl = params.get('ws') || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+let ws, cfg = null, last = null, autoMode = false;
+
+function connect() {
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => { $('conn').textContent = 'connected'; $('conn').className = 'pill on'; send({type:'hello', role:'viewer', client:'dashboard'}); };
+  ws.onclose = () => { $('conn').textContent = 'disconnected'; $('conn').className = 'pill off'; setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = ev => { const m = JSON.parse(ev.data); handle(m); };
+}
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+function param(name, value) { send({type:'set_param', name, value: parseFloat(value)}); }
+
+function handle(m) {
+  if (m.type === 'config') { cfg = m; applyConfig(); return; }
+  if (m.type === 'goal') { $('goal').textContent = m.goal ? `${m.goal.x.toFixed(2)}, ${m.goal.y.toFixed(2)}` : 'none'; return; }
+  if (m.type === 'mode') { autoMode = m.mode === 'auto'; $('autobtn').textContent = autoMode ? 'AUTO ✓ (click for manual)' : 'MANUAL (click for auto)'; $('modepill').textContent = 'mode: ' + m.mode; return; }
+  if (m.type !== 'nav') return;
+  last = m;
+  if (m.images) {
+    if (m.images.camera) $('camera').src = m.images.camera;
+    if (m.images.depth) $('depth').src = m.images.depth;
+    if (m.images.costmap) $('costmap').src = m.images.costmap;
+    if (m.images.global) $('global').src = m.images.global;
+  }
+  $('fps').textContent = (m.fps ?? '–') + ' fps' + (m.dropped ? ` · ${m.dropped} dropped` : '');
+  $('status').textContent = m.status; $('status').className = 'status ' + m.status;
+  $('note').textContent = m.note || '';
+  if (m.cmd) $('cmd').innerHTML = m.cmd.v > 0 ? `v <b>${m.cmd.v.toFixed(2)}</b> m/s &nbsp; ω <b>${m.cmd.omega >= 0 ? '+' : ''}${m.cmd.omega.toFixed(2)}</b> rad/s ${m.cmd.omega > 0.05 ? '↰ left' : m.cmd.omega < -0.05 ? '↱ right' : '↑ straight'}` : `<span class="bad">STOP</span>${m.cmd.omega ? ` · rotate ω ${m.cmd.omega.toFixed(2)}` : ''}`;
+  $('goal').textContent = m.goal ? `${m.goal.x.toFixed(2)}, ${m.goal.y.toFixed(2)}` : 'none';
+  $('dist').textContent = m.dist_to_goal != null ? m.dist_to_goal.toFixed(2) + ' m' : '–';
+  $('pose').textContent = m.pose ? `${m.pose.x.toFixed(2)}, ${m.pose.y.toFixed(2)}  θ ${(m.pose.theta * 180 / Math.PI).toFixed(0)}°` : (m.has_pose ? '–' : 'no pose source (local only)');
+  $('seq').textContent = m.seq;
+  if (m.plane) {
+    const p = m.plane, okc = p.ok && p.confidence >= 0.3;
+    $('planesrc').textContent = p.source;
+    $('ph').innerHTML = p.ok ? `<b class="${okc ? 'ok' : 'warn'}">${p.height.toFixed(3)} m</b>` : '<span class="bad">lost</span>';
+    $('pp').textContent = p.ok ? `${p.pitch_deg.toFixed(1)}°` : '–';
+    $('pr').textContent = p.ok ? `${p.roll_deg.toFixed(1)}°` : '–';
+    $('pc').innerHTML = p.ok ? `<span class="${okc ? 'ok' : 'warn'}">${(p.confidence * 100).toFixed(0)} %</span> (${p.inliers}/${p.candidates} ground pts)` : '–';
+    $('pm').textContent = p.mount_err ? `Δh ${(p.mount_err.height * 100).toFixed(1)} cm, Δpitch ${p.mount_err.pitch_deg.toFixed(2)}°` : (m.has_pose ? '–' : 'n/a (no fixed mount)');
+  }
+  $('warn').textContent = (m.warnings && m.warnings.length) ? m.warnings.join(' · ') : '–';
+  $('prof').textContent = m.profile ? Object.entries(m.profile).map(([k, v]) => `${k} ${v}`).join(' · ') : '–';
+  $('depthpill').textContent = 'depth: ' + m.depth_mode + (m.scale && m.scale !== 1 ? ` ×${m.scale}` : '');
+  $('depthkind').textContent = m.depth_mode;
+  if (m.local && m.local.grid) { const g = m.local.grid; $('gridinfo').textContent = `${g.x_min}–${g.x_max} m × ±${g.y_max} m @ ${g.res} m`; }
+  if (m.global && m.global.meta) $('globalinfo').textContent = `${(m.global.meta.w * m.global.meta.res).toFixed(0)} m view @ ${m.global.meta.res} m`;
+  if (m.mode) { autoMode = m.mode === 'auto'; $('modepill').textContent = 'mode: ' + m.mode; $('autobtn').textContent = autoMode ? 'AUTO ✓ (click for manual)' : 'MANUAL (click for auto)'; }
+}
+
+function applyConfig() {
+  $('src').textContent = 'source: ' + cfg.source;
+  $('globalpanel').hidden = !cfg.has_pose;
+  $('modepill').hidden = cfg.source !== 'sim';
+  $('autobtn').hidden = cfg.source !== 'sim';
+  $('goalframe').textContent = cfg.goal_frame === 'world' ? 'goal (world m)' : 'goal (robot frame m: x ahead, y left)';
+  $('localhint').textContent = cfg.has_pose ? 'Green free · yellow rough · magenta lethal · grey unknown. Robot at bottom centre.' : 'Green free · yellow rough · magenta lethal · grey unknown. Click to set a local goal (no pose source → local only).';
+  const sel = $('depthsel'); sel.innerHTML = '';
+  for (const d of cfg.depth_modes) { const o = document.createElement('option'); o.value = d; o.textContent = d; o.selected = d === cfg.depth_mode; sel.appendChild(o); }
+  if (cfg.tunables) { $('obs').value = cfg.tunables.obstacle_h; $('ditch').value = cfg.tunables.ditch_h; $('rr').value = cfg.tunables.robot_radius; }
+  $('modepill').textContent = 'mode: ' + cfg.mode; autoMode = cfg.mode === 'auto';
+  $('autobtn').textContent = autoMode ? 'AUTO ✓ (click for manual)' : 'MANUAL (click for auto)';
+}
+
+function setGoalFromInputs() {
+  const x = parseFloat($('gx').value), y = parseFloat($('gy').value);
+  if (isNaN(x) || isNaN(y)) return;
+  send({type:'set_goal', x, y});
+}
+function toggleAuto() { send({type:'set_mode', auto: !autoMode}); }
+
+// click on the GLOBAL map -> world goal
+$('global').addEventListener('click', ev => {
+  if (!last || !last.global || !last.global.meta) return;
+  const img = ev.currentTarget, r = img.getBoundingClientRect();
+  const px = (ev.clientX - r.left) * img.naturalWidth / r.width;
+  const py = (ev.clientY - r.top) * img.naturalHeight / r.height;
+  const mt = last.global.meta;
+  const wx = mt.origin_x + (px / mt.scale) * mt.res;
+  const wy = mt.origin_y + ((img.naturalHeight - py) / mt.scale) * mt.res;
+  $('gx').value = wx.toFixed(2); $('gy').value = wy.toFixed(2);
+  send({type:'set_goal', x: wx, y: wy});
+});
+
+// click on the LOCAL costmap -> robot-frame goal (only meaningful without a pose source)
+$('costmap').addEventListener('click', ev => {
+  if (!last || !last.local || !last.local.grid) return;
+  const img = ev.currentTarget, r = img.getBoundingClientRect(), g = last.local.grid;
+  const fx = (ev.clientX - r.left) / r.width, fy = (ev.clientY - r.top) / r.height;
+  const x = g.x_max - fy * (g.x_max - g.x_min);        // top of the image = far
+  const y = g.y_max - fx * (g.y_max - g.y_min);        // left of the image = +Y
+  if (cfg && cfg.has_pose && last.pose) {
+    const c = Math.cos(last.pose.theta), s = Math.sin(last.pose.theta);
+    const wx = last.pose.x + x * c - y * s, wy = last.pose.y + x * s + y * c;
+    $('gx').value = wx.toFixed(2); $('gy').value = wy.toFixed(2);
+    send({type:'set_goal', x: wx, y: wy});
+  } else {
+    $('gx').value = x.toFixed(2); $('gy').value = y.toFixed(2);
+    send({type:'set_goal', x, y});
+  }
+});
+
+connect();
+</script>
+</body>
+</html>

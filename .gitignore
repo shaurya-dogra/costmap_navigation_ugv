@@ -6,17 +6,23 @@ __pycache__/
 venv/
 env/
 
-# Model weights & media (large, regenerated/downloaded — see README §19)
+# Model weights & media (large; downloaded on first run or regenerated)
 *.pt
 *.pth
 *.mp4
 *.mov
 *.avi
 debug_cam.jpg
+debug_*.jpg
 
-# OS
+# 3D assets live in ../SLAM3D/public (see README)
+*.glb
+
+# OS / editors
 .DS_Store
-
-# Editors
 .vscode/
 .idea/
+
+# scratch
+scratch/
+*.log

@@ -54,6 +54,9 @@
 
 # webcam: laptop on the ground, dashboard in the browser
 ./run_webcam.sh
+
+# stop everything (servers, sim, ports)
+./stop_all.sh
 ```
 
 Then, in the sim: press **T** (or the HUD button) for AUTO, and click a destination on
@@ -233,7 +236,7 @@ dashboard/index.html    browser dashboard (any source)
 PROTOCOL.md             wire protocol between sim, server and viewers
 synth_scene.py          analytic scenes for tests and for driving the server without a browser
 test_perception_core.py / test_nav.py     test suites
-run_sim.sh / run_webcam.sh                one-command launchers
+run_sim.sh / run_webcam.sh / stop_all.sh  one-command launchers and shutdown
 costmap_prototype.py, sim.py, test_geometry.py, calibrate.py   legacy prototype (see §12)
 sim3d/src/nav/*         config, frames, WebSocket link, capture, course + ground truth
 sim3d/src/components/*  Environment, Vehicle, RobotCamera, GoalMarker, Hud, MiniMap

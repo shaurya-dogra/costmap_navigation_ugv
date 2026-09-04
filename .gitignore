@@ -15,8 +15,10 @@ env/
 debug_cam.jpg
 debug_*.jpg
 
-# 3D assets live in ../SLAM3D/public (see README)
+# 3D assets (Sketchfab .glb, ~40 MB) are not in git; see README
 *.glb
+sim3d/node_modules/
+sim3d/dist/
 
 # OS / editors
 .DS_Store

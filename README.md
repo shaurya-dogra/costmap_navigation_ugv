@@ -35,7 +35,7 @@
 | **Nav2-style planning** | `navstack.py` | Global costmap with memory, coarse global A\*, carrot hand-off, local A\* + pure pursuit, turn-in-place / blocked recovery, watchdog |
 | **Server** | `perception_server.py` | One process for every mode: sim frames over WebSocket, webcam, or video. Broadcasts costmaps, plans and commands as JSON |
 | **Dashboard** | `dashboard/index.html` | Camera + semantics, depth, local costmap, global map, plane estimate, goal input |
-| **3D rover sim** | `../SLAM3D` | React Three Fiber + Rapier rover on a 100 m outdoor course; streams its camera (RGB + true depth) and drives on the returned commands |
+| **3D rover sim** | `sim3d/` (from [SLAM3D](https://github.com/Klick07/SLAM3D)) | React Three Fiber + Rapier rover on a 100 m outdoor course; streams its camera (RGB + true depth) and drives on the returned commands |
 | **ROS shapes** | `ros_msgs.py` | `OccupancyGrid`, `Odometry`, `Path`, `Twist` as JSON, ready for rosbridge |
 
 ---
@@ -45,8 +45,8 @@
 ```bash
 # one-time
 ./setup_mac.sh                      # venv + pip install (Apple Silicon: MPS)
-git clone https://github.com/Klick07/SLAM3D.git ../SLAM3D   # the rover sim (if not present)
-# copy rover.glb road.glb tree.glb into ../SLAM3D/public/ (assets are not in git)
+# the rover sim is in ./sim3d ; copy rover.glb road.glb tree.glb into sim3d/public/
+# (Sketchfab assets, not in git)
 
 # 3D demo: perception server + rover sim, opens the browser
 ./run_sim.sh                        # ground-truth depth from the renderer
@@ -115,7 +115,7 @@ live accuracy check: the HUD shows the estimate against the mount.
 
 ## 4. The 3D simulation demo
 
-`../SLAM3D` (React Three Fiber + Rapier). The rover carries a camera at 1.0 m, pitched
+`sim3d/` (React Three Fiber + Rapier; upstream: [Klick07/SLAM3D](https://github.com/Klick07/SLAM3D)). The rover carries a camera at 1.0 m, pitched
 15° down, 60° vertical FOV. Each capture (≤ 6 Hz, one frame in flight):
 
 1. renders the scene from the rover's camera into an offscreen target (linear → sRGB
@@ -235,8 +235,8 @@ synth_scene.py          analytic scenes for tests and for driving the server wit
 test_perception_core.py / test_nav.py     test suites
 run_sim.sh / run_webcam.sh                one-command launchers
 costmap_prototype.py, sim.py, test_geometry.py, calibrate.py   legacy prototype (see §12)
-../SLAM3D/src/nav/*     config, frames, WebSocket link, capture, course + ground truth
-../SLAM3D/src/components/*   Environment, Vehicle, RobotCamera, GoalMarker, Hud, MiniMap
+sim3d/src/nav/*         config, frames, WebSocket link, capture, course + ground truth
+sim3d/src/components/*  Environment, Vehicle, RobotCamera, GoalMarker, Hud, MiniMap
 ```
 
 Models download to the HuggingFace cache on first run: `Depth-Anything-V2-Metric-Outdoor-Small-hf`

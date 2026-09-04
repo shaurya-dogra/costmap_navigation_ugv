@@ -10,7 +10,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SLAM3D_DIR="${SLAM3D_DIR:-../SLAM3D}"
+# the sim lives in ./sim3d (a copy of https://github.com/Klick07/SLAM3D with the
+# autonomy additions); SLAM3D_DIR can point at a separate checkout instead
+SLAM3D_DIR="${SLAM3D_DIR:-$([[ -d sim3d ]] && echo sim3d || echo ../SLAM3D)}"
 PORT="${PORT:-8790}"
 VITE_PORT="${VITE_PORT:-5173}"
 DEPTH="sim"

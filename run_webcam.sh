@@ -21,7 +21,7 @@ if [[ ! -d .venv ]]; then
   echo "no .venv - run ./setup_mac.sh first"; exit 1
 fi
 
-ARGS=(--source 0 --rig macbook --depth metric --profile --port "$PORT")
+ARGS=(--source 0 --rig macbook --depth metric --depth-res 280 --profile --port "$PORT")
 if [[ $# -gt 0 ]]; then
   # user flags override / extend the defaults (argparse takes the last value)
   ARGS+=("$@")

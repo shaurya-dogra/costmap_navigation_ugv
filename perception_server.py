@@ -52,9 +52,19 @@ import navstack as ns
 import ros_msgs as rm
 
 HERE = Path(__file__).resolve().parent
-SEM_WEIGHTS = [HERE / ".." / "object segmentation" / "yolo26s-sem-ade20k.pt",
+# Semantic weights per source. The sim keeps the higher-capacity "s" model (its
+# frames are synthetic and it has GPU headroom); camera sources default to the
+# nano model, 3x faster, so the live feed stays real-time. --sem-weights overrides.
+SEM_WEIGHTS = {
+    "sim": [HERE / ".." / "object segmentation" / "yolo26s-sem-ade20k.pt",
+            HERE / "yolo26s-sem-ade20k.pt",
+            HERE / ".." / "object segmentation" / "yolo26n-sem-ade20k.pt",
+            HERE / "yolo26n-sem-ade20k.pt"],
+    "camera": [HERE / "yolo26n-sem-ade20k.pt",
                HERE / ".." / "object segmentation" / "yolo26n-sem-ade20k.pt",
-               HERE / "yolo26n-sem-ade20k.pt"]
+               HERE / ".." / "object segmentation" / "yolo26s-sem-ade20k.pt",
+               HERE / "yolo26s-sem-ade20k.pt"],
+}
 
 TUNABLE = ("obstacle_h", "ditch_h", "robot_radius", "sem_lethal_frac", "min_cell_pts",
            "plane_gate", "plane_near_range", "max_depth")
@@ -158,8 +168,8 @@ class CaptureSource(threading.Thread):
             print(f"[capture] cannot open source {self.src}", file=sys.stderr)
             os._exit(2)
         if not self.is_file:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.size[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.size[1])
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, max(self.size[0], 1280))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, max(self.size[1], 720))
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         period = 1.0 / self.fps_cap if self.fps_cap else 0.0
         i = 0
@@ -225,7 +235,7 @@ class PerceptionServer:
             self.gmap = ns.GlobalCostmap(res=0.25, size_m=160.0)
             self.pose_src = ns.GroundTruthPose()
         else:
-            W, H = 1280, 720
+            W, H = a.proc_width, int(round(a.proc_width * 9 / 16))
             preset = pc.RIG_PRESETS.get(a.rig, {})
             hfov = a.hfov or preset.get("hfov") or 78.0
             fx, fy, cx, cy = pc.intrinsics_from_hfov(W, H, hfov)
@@ -247,6 +257,10 @@ class PerceptionServer:
         if a.goal:
             gx, gy = (float(v) for v in a.goal.split(","))
             self.nav.set_goal(gx, gy)
+        elif self.source_kind != "sim":
+            # no pose source: the goal is a carrot in the robot frame, so a plan
+            # (and a cmd_vel) is always produced for the feed in front of the camera
+            self.nav.set_goal(self.cfg.x_max - 1.0, 0.0)
 
         # ---- models -----------------------------------------------------------
         self.device = pc.pick_device()
@@ -254,7 +268,8 @@ class PerceptionServer:
         self.depth_models: dict = {}
         if self.depth_mode != "sim" or self.source_kind != "sim":
             self._depth_model("metric" if self.depth_mode == "sim" else self.depth_mode)
-        weights = next((p for p in SEM_WEIGHTS if p.exists()), None)
+        candidates = SEM_WEIGHTS["sim" if self.source_kind == "sim" else "camera"]
+        weights = next((p for p in candidates if p.exists()), None)
         if a.sem_weights:
             weights = Path(a.sem_weights)
         if weights is None:
@@ -567,7 +582,8 @@ class PerceptionServer:
             self.loop = asyncio.get_running_loop()
             self.worker.start()
             if self.source_kind != "sim":
-                self.capture = CaptureSource(self.a.source, self.slot, every=self.a.every, fps_cap=self.a.fps_cap)
+                self.capture = CaptureSource(self.a.source, self.slot, size=(self.cfg.w, self.cfg.h),
+                                             every=self.a.every, fps_cap=self.a.fps_cap)
                 self.capture.start()
             if self.windows:
                 self.loop.call_later(0.5, self._window_tick)
@@ -596,7 +612,8 @@ def main():
     ap.add_argument("--w-max", dest="w_max", type=float, default=None)
     ap.add_argument("--robot-radius", dest="robot_radius", type=float, default=None)
     ap.add_argument("--map-view", dest="map_view", type=float, default=60.0, help="global map crop shown, metres")
-    ap.add_argument("--depth-res", dest="depth_res", type=int, default=336)
+    ap.add_argument("--depth-res", dest="depth_res", type=int, default=336, help="depth model input (multiple of 14; 252/280 faster)")
+    ap.add_argument("--proc-width", dest="proc_width", type=int, default=640, help="processing width for camera/video sources (16:9)")
     ap.add_argument("--depth-smooth", dest="depth_smooth", type=float, default=0.0, help="EMA on the depth map (0 = off)")
     ap.add_argument("--sem-weights", dest="sem_weights", default=None)
     ap.add_argument("--sem-imgsz", dest="sem_imgsz", type=int, default=640)

@@ -1,0 +1,9 @@
+# Mac (M4): plain pip wheels are Metal/MPS ready.
+# RTX 5050: install torch from pytorch.org with the CUDA index URL instead.
+torch>=2.3
+torchvision>=0.18
+transformers>=4.45
+ultralytics>=8.3
+opencv-python>=4.9
+numpy>=1.26
+pillow

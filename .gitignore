@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Model weights & media (large, regenerated/downloaded — see README §19)
+*.pt
+*.pth
+*.mp4
+*.mov
+*.avi
+debug_cam.jpg
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/

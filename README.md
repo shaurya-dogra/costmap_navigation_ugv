@@ -10,6 +10,8 @@
 
 ---
 
+> **New here?** Read [EXPLAINED.md](EXPLAINED.md): the whole pipeline, every equation, in plain language.
+
 ## Contents
 
 1. [What you get](#1-what-you-get)

@@ -1,38 +1,72 @@
 # Perception server protocol
 
-`perception_server.py` speaks one WebSocket endpoint, `ws://<host>:8790/ws`, to two
+`perception_server.py` speaks one WebSocket endpoint, `ws://<host>:8790/ws`, to three
 kinds of client:
 
 | role     | who                         | sends                         | receives          |
 |----------|-----------------------------|-------------------------------|-------------------|
 | `sim`    | the Three.js rover (SLAM3D) | binary **frames**, commands   | `config`, `nav`   |
+| `rover`  | the Pi (`rover_agent.py`)   | binary **frames**, `hello`    | `config`, `nav`   |
 | `viewer` | `dashboard/index.html`      | commands                      | `config`, `nav`   |
 
 With `--source <camera|video>` the server captures frames itself and every client is a
-viewer. All text messages are JSON objects with a `type` field.
+viewer. With `--source rover` the server instead waits for the Pi to push frames, exactly
+as it does for `sim`. All text messages are JSON objects with a `type` field.
+
+## Capability flags
+
+`--source` no longer drives behaviour directly. `PerceptionServer.__init__` sets four
+booleans once from `source_kind`, and every downstream branch (handshake reset, depth
+selection, mount-error reporting, watchdog) reads only these:
+
+| flag             | true for       | meaning                                               |
+|------------------|----------------|--------------------------------------------------------|
+| `pushes_frames`  | `sim`, `rover` | frames arrive over the socket, not captured locally     |
+| `has_true_depth` | `sim`          | renderer depth rides in the frame (`depth` block)       |
+| `has_pose`       | `sim`          | a pose source exists (ground truth today, SLAM later)   |
+| `is_vehicle`     | `sim`, `rover` | `cmd_vel` reaches something real                        |
+
+`webcam` and `video` sources leave all four `false`. Adding a new source means declaring
+what it can do, not re-editing every call site that used to switch on `source_kind`.
 
 ## 1. Handshake
 
 Client → server, first message:
 
 ```json
-{"type": "hello", "role": "sim" | "viewer", "client": "free text"}
+{"type": "hello", "role": "sim" | "rover" | "viewer", "client": "free text"}
 ```
 
 Server → that client:
 
 ```json
-{"type": "config", "source": "sim" | "webcam" | "video", "has_pose": true,
- "depth_mode": "metric" | "relative" | "sim", "depth_modes": ["metric", "relative", "sim"],
+{"type": "config", "source": "sim" | "rover" | "webcam" | "video", "has_pose": true,
+ "depth_mode": "metric" | "metric-indoor" | "relative" | "affine" | "sim",
+ "depth_modes": ["metric", "metric-indoor", "relative", "affine", "sim"],
  "v_max": 2.0, "w_max": 1.0, "robot_radius": 0.8,
  "grid": {"x_min": 0.5, "x_max": 12.0, "y_min": -5.0, "y_max": 5.0, "res": 0.1},
  "goal_frame": "world" | "robot"}
 ```
 
-A new `hello` with role `sim` resets the global map, the goal and the ground-plane state
-(the page was reloaded).
+`"sim"` is appended to `depth_modes` only when `has_true_depth` (the sim source); every
+other source's `config` lists just the first four.
 
-## 2. Frames (sim → server, binary)
+* `metric` — Depth Anything V2 metric-outdoor (default). `metric-indoor` — same model,
+  indoor-tuned: the outdoor model reads a ~2 m indoor wall as 5-9 m and leaves most pixels
+  outside `max_depth`. `relative` — `1/disp` scaled by `nominal_height`; wrong whenever the
+  true affine shift isn't ~0. `affine` — solves the disparity-to-depth shift from ground
+  planarity instead of assuming it's zero. `sim` — renderer ground truth.
+* `affine` is **not** the recommended default: the ground-planarity system has an exact
+  null direction between the affine offset `b` and the plane's own `m_z` term (adding the
+  same delta to both changes nothing), so it needs an external
+  orientation constraint (an IMU gravity vector, or non-coplanar SLAM points) that the
+  server does not have yet — without one it returns `(None, None, info)` and the plane is
+  lost. Use `metric` outdoors, `metric-indoor` indoors.
+
+A new `hello` with role `sim` or `rover` resets the global map, the goal and the
+ground-plane state (the page was reloaded, or the rover reconnected).
+
+## 2. Frames (sim/rover → server, binary)
 
 ```
 u32 little-endian header length | header JSON (UTF-8) | JPEG bytes | [u16 LE depth]
@@ -43,6 +77,7 @@ Header:
 ```json
 {"type": "frame", "seq": 1234, "t": 1725500000123.4,
  "w": 640, "h": 360, "fx": 311.8, "fy": 311.8, "cx": 320, "cy": 180,
+ "dist": [0.0, 0.0, 0.0, 0.0, 0.0],
  "cam_height": 1.0, "cam_pitch": 0.2618,
  "pose": {"x": 12.3, "y": -4.5, "theta": 1.57},
  "mode": "auto" | "manual",
@@ -53,13 +88,30 @@ Header:
 * `fx fy cx cy` are exact pinhole intrinsics of the POV camera **at the JPEG's
   resolution**. Three.js `PerspectiveCamera.fov` is the vertical FOV, so
   `fy = (h/2) / tan(fov/2)`, `fx = fy`.
+* `dist`, when present, is `[k1, k2, p1, p2, k3]` OpenCV distortion coefficients (as
+  printed by `calibrate.py`). The server rectifies the frame with these **before** any
+  geometry is computed — `backproject_optical` is a pure pinhole model, and uncorrected
+  barrel distortion bows the ground plane upward at the image edges and invents LETHAL
+  cells along both sides of the path. An absent or all-zero `dist` is a no-op, which is
+  why the simulator (no `dist` field at all) is unaffected.
 * `cam_height` / `cam_pitch` are the mount values, used only to report the estimator's
-  error against them (`plane.mount_err`). The server never trusts them.
-* `pose` is the robot in the **nav world frame** (X = −three.z, Y = −three.x,
-  θ = heading, CCW positive). This is the VSLAM placeholder.
+  error against them (`plane.mount_err`). The server never trusts them for geometry. The
+  rover sends `cam_height` (its tape-measured mount height, default 0.17 m) but no
+  `cam_pitch` — it has no orientation source. That same tape measurement, passed to the
+  server as `--nominal-height`, is what gives the whole map its metric scale whenever the
+  depth model itself carries none (`relative` / `affine`).
+* `pose` and `mode` are sim-only: the sim is the only source with a pose feed and a
+  manual/auto toggle. The rover sends neither key.
 * `depth`, when present, is `w*h` unsigned 16-bit millimetres, row-major from the top
   row, `0` = no measurement (sky / beyond range). It is used only in `--depth sim` mode.
-* `seq` regressing (page reload) resets the server's map and goal.
+  The rover sends no depth block at all — `"depth": null`, always; only the sim sends one.
+* The rover may rotate a frame upright before sending it (`--rotation 90/180/270`, to
+  correct a sideways camera mount without physically remounting it). When it does, `w`,
+  `h`, `fx`, `fy`, `cx`, `cy` describe the **rotated** image — a 90°/270° turn also swaps
+  `fx`/`fy` and moves the principal point — so the server needs no knowledge of how the
+  camera happens to be bolted on.
+* `seq` regressing (page reload, or the rover reconnecting) resets the server's map and
+  goal.
 
 The server processes the **latest** frame only; a frame arriving while another is being
 processed replaces it. Send at most one frame per received `nav` (or at ≤ 8 Hz).
@@ -71,7 +123,7 @@ processed replaces it. Send at most one frame per received `nav` (or at ≤ 8 Hz
 {"type": "clear_goal"}
 {"type": "set_mode", "auto": true}             // relayed to the sim inside `nav`
 {"type": "reset"}                              // global map + goal + plane state
-{"type": "set_depth", "mode": "metric" | "relative" | "sim"}
+{"type": "set_depth", "mode": "metric" | "metric-indoor" | "relative" | "affine" | "sim"}
 {"type": "set_param", "name": "obstacle_h", "value": 0.3}   // tunables, see server --help
 ```
 

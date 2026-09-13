@@ -11,7 +11,7 @@ export default function MiniMap({ course, telemetry }) {
   const [big, setBig] = useState(false);
   const ref = useRef(null);
   const { nav, goal } = useNav();
-  const W = big ? 560 : 240, H = Math.round(W * (Z_BOT - Z_TOP) / (X1 - X0));
+  const W = big ? 560 : 200, H = Math.round(W * (Z_BOT - Z_TOP) / (X1 - X0));
 
   useEffect(() => {
     const c = ref.current; if (!c) return;
@@ -67,9 +67,9 @@ export default function MiniMap({ course, telemetry }) {
   };
 
   return (
-    <div style={{ position: "absolute", bottom: 12, left: 16, zIndex: 11, background: "rgba(10,12,18,0.72)", padding: 6, borderRadius: 8, fontFamily: "ui-monospace, Menlo, monospace", fontSize: 11, color: "#cbd5e1" }}>
+    <div style={{ position: "absolute", bottom: 8, left: 8, zIndex: 11, background: "rgba(10,12,18,0.72)", padding: 6, borderRadius: 8, fontFamily: "ui-monospace, Menlo, monospace", fontSize: 11, color: "#cbd5e1" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-        <span>course map · click to flag the destination</span>
+        <span>course map · click = goal</span>
         <button onClick={() => setBig((b) => !b)} style={{ background: "#1f2937", color: "#fff", border: "1px solid #374151", borderRadius: 4, padding: "1px 8px", cursor: "pointer" }}>{big ? "▣ shrink" : "▢ expand"}</button>
       </div>
       <canvas ref={ref} width={W} height={H} onClick={onClick} style={{ display: "block", width: W, height: H, cursor: "crosshair", borderRadius: 4 }} />

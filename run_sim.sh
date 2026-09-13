@@ -43,11 +43,11 @@ for f in rover.glb road.glb tree.glb; do
 done
 
 export PYTORCH_ENABLE_MPS_FALLBACK=1
-cleanup() { echo; echo "stopping..."; kill 0 2>/dev/null || true; }
+cleanup() { trap - EXIT INT TERM; echo; echo "stopping..."; kill 0 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
 echo "[1/2] perception server  ->  http://localhost:$PORT   (depth: $DEPTH)"
-.venv/bin/python perception_server.py --source sim --depth "$DEPTH" --auto --port "$PORT" --profile "${EXTRA[@]}" &
+.venv/bin/python perception_server.py --source sim --depth "$DEPTH" --auto --port "$PORT" --profile ${EXTRA[@]+"${EXTRA[@]}"} &
 
 echo "[2/2] SLAM3D rover       ->  http://localhost:$VITE_PORT"
 (cd "$SLAM3D_DIR" && npx vite --port "$VITE_PORT" --strictPort) &

@@ -7,12 +7,19 @@ One process serves every demo mode:
 
   --source sim          frames are PUSHED by the Three.js rover over WebSocket
                         (RGB JPEG + optional true depth); commands go back.
+  --source rover        frames are PUSHED by the real Pi (rover_agent.py) over the same
+                        socket: RGB JPEG + intrinsics + lens distortion, no depth.
   --source 0            MacBook / phone webcam captured here, dashboard only.
   --source clip.mp4     recorded footage, looped.
 
+Behaviour is driven by CAPABILITY FLAGS set once in __init__ (pushes_frames,
+has_true_depth, has_pose, is_vehicle), never by the source name - so adding a source
+means declaring what it can do rather than editing every branch that used to test it.
+
 Pipeline per frame (worker thread, latest frame wins):
 
-  depth  (Depth Anything V2 metric | relative | simulator ground truth)
+  undist (lens rectification; a no-op when the source sends no coefficients)
+  depth  (Depth Anything V2 metric | metric-indoor | relative | affine | sim truth)
   sem    (YOLO26 ADE20K -> per-pixel cost)
   core   (perception_core: self-calibrating ground plane -> local costmap)
   nav    (navstack: global fusion + global A* + carrot + local A* + pure pursuit)
@@ -21,6 +28,7 @@ Pipeline per frame (worker thread, latest frame wins):
     python perception_server.py --source 0 --rig macbook
     python perception_server.py --source sim --depth sim
     python perception_server.py --source 3d_sim_video.mp4 --depth metric --windows
+    python perception_server.py --source rover --depth metric-indoor --profile
 
 then open http://localhost:8790 (dashboard) and/or the SLAM3D page.
 """
@@ -49,6 +57,7 @@ from aiohttp import web, WSMsgType
 
 import perception_core as pc
 import navstack as ns
+import ground_vo as gvo
 import ros_msgs as rm
 
 HERE = Path(__file__).resolve().parent
@@ -64,6 +73,17 @@ SEM_WEIGHTS = {
                HERE / ".." / "object segmentation" / "yolo26n-sem-ade20k.pt",
                HERE / ".." / "object segmentation" / "yolo26s-sem-ade20k.pt",
                HERE / "yolo26s-sem-ade20k.pt"],
+    # The rover gets the "s" model, NOT the nano one, and the reason is worth recording.
+    # On a polished indoor floor the nano model labelled 91 % of the ground "water" -
+    # cost 254, which build_costmap treats as UNCONDITIONALLY lethal because water has no
+    # height for the geometry channel to argue with. The rover was correctly refusing to
+    # drive across a dry floor. The "s" model labelled the same frame 100 % "floor".
+    # Compute is off-board here, so the extra tens of milliseconds are worth paying;
+    # --sem-weights still overrides.
+    "rover":  [HERE / ".." / "object segmentation" / "yolo26s-sem-ade20k.pt",
+               HERE / "yolo26s-sem-ade20k.pt",
+               HERE / ".." / "object segmentation" / "yolo26n-sem-ade20k.pt",
+               HERE / "yolo26n-sem-ade20k.pt"],
 }
 
 TUNABLE = ("obstacle_h", "ditch_h", "robot_radius", "sem_lethal_frac", "min_cell_pts",
@@ -211,8 +231,19 @@ class PerceptionServer:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.clients: dict = {}                 # ws -> role
         self.slot = FrameSlot()
-        self.source_kind = "sim" if a.source == "sim" else ("video" if Path(a.source).exists() else "webcam")
-        self.has_pose = self.source_kind == "sim"
+        if a.source in ("sim", "rover"):
+            self.source_kind = a.source
+        else:
+            self.source_kind = "video" if Path(a.source).exists() else "webcam"
+
+        # ---- capabilities ------------------------------------------------------
+        # Everything below branches on THESE, never on source_kind again. Adding a
+        # source then means declaring what it can do, instead of editing ten call
+        # sites and hoping none was missed - which is how the sim path would break.
+        self.pushes_frames = self.source_kind in ("sim", "rover")   # frames arrive over the socket
+        self.has_true_depth = self.source_kind == "sim"             # renderer depth rides in the frame
+        self.has_pose = self.source_kind in ("sim", "rover")        # sim: ground truth; rover: ground-plane VO
+        self.is_vehicle = self.source_kind in ("sim", "rover")      # cmd_vel reaches something real
         self.mode_auto = a.auto
         self.depth_mode = a.depth
         self.lock = threading.Lock()
@@ -224,6 +255,9 @@ class PerceptionServer:
         self.fps = 0.0
         self.windows = a.windows
         self._win_frames: dict = {}
+        self.vo: Optional[gvo.GroundVO] = None   # rover only; None elsewhere
+        self._streams: dict = {}          # name -> latest full-size JPEG bytes
+        self._stream_seq = -1             # bumped per processed frame, so viewers can wait
 
         # ---- config per source -------------------------------------------------
         if self.source_kind == "sim":
@@ -234,6 +268,27 @@ class PerceptionServer:
                                   lookahead=2.5, stop_dist=1.2, turn_gain=1.0, turn_enter_deg=70.0)
             self.gmap = ns.GlobalCostmap(res=0.25, size_m=160.0)
             self.pose_src = ns.GroundTruthPose()
+        elif self.source_kind == "rover":
+            # Measured rig: IMX219 at 640x480 from the FULL-FOV 1640x1232 sensor mode.
+            # The camera sits ~0.17 m up, so the honest sensing horizon is 2.6 m and the
+            # speeds are scaled to it: at 0.5 m/s with ~150 ms of link latency the rover
+            # stops well inside the map. See pc.rover_cfg for the derivation.
+            self.cfg = pc.rover_cfg(cam_height=a.nominal_height or 0.17,
+                                    robot_radius=a.robot_radius or 0.20)
+            if a.hfov:
+                self.cfg.fx, self.cfg.fy, self.cfg.cx, self.cfg.cy = pc.intrinsics_from_hfov(
+                    self.cfg.w, self.cfg.h, a.hfov)
+            self.ncfg = ns.NavCfg(v_max=a.v_max or 0.5, w_max=a.w_max or 1.0, goal_tol=0.35,
+                                  slow_dist=1.0, lookahead=0.6, stop_dist=0.35,
+                                  turn_min_x=0.4, accel_max=0.6)
+            # Ground-plane visual odometry supplies the pose, so the global map works.
+            # 0.05 m to match the local grid, 16 m across - a rover with a 2.6 m horizon
+            # is not going to outrun that, and it keeps fuse() cheap.
+            self.gmap = ns.GlobalCostmap(res=0.05, size_m=16.0)
+            self.pose_src = ns.VisualOdomPose()
+            self.vo = gvo.GroundVO()
+            if a.map_view == 60.0:      # the sim-scaled default dwarfs a 16 m map
+                a.map_view = 8.0
         else:
             W, H = a.proc_width, int(round(a.proc_width * 9 / 16))
             preset = pc.RIG_PRESETS.get(a.rig, {})
@@ -250,14 +305,17 @@ class PerceptionServer:
             self.cfg.lock_pitch = math.radians(a.pitch)
         if a.roll is not None:
             self.cfg.lock_roll = math.radians(a.roll)
-        self.cfg.nominal_height = a.nominal_height
+        if a.nominal_height is not None:
+            self.cfg.nominal_height = a.nominal_height
+        if a.dist:                       # camera/video rigs; the rover sends its own per frame
+            self.cfg.dist = tuple(float(v) for v in a.dist.split(","))
         self.core = pc.PerceptionCore(self.cfg)
         self.nav = ns.Navigator(self.cfg, self.ncfg, self.gmap,
                                 ns.PlannerCfg(robot_radius=self.cfg.robot_radius))
         if a.goal:
             gx, gy = (float(v) for v in a.goal.split(","))
             self.nav.set_goal(gx, gy)
-        elif self.source_kind != "sim":
+        elif not self.has_pose:
             # no pose source: the goal is a carrot in the robot frame, so a plan
             # (and a cmd_vel) is always produced for the feed in front of the camera
             self.nav.set_goal(self.cfg.x_max - 1.0, 0.0)
@@ -266,9 +324,9 @@ class PerceptionServer:
         self.device = pc.pick_device()
         print(f"[server] device {self.device}, source {self.source_kind}, depth {self.depth_mode}")
         self.depth_models: dict = {}
-        if self.depth_mode != "sim" or self.source_kind != "sim":
+        if self.depth_mode != "sim" or not self.has_true_depth:
             self._depth_model("metric" if self.depth_mode == "sim" else self.depth_mode)
-        candidates = SEM_WEIGHTS["sim" if self.source_kind == "sim" else "camera"]
+        candidates = SEM_WEIGHTS.get(self.source_kind, SEM_WEIGHTS["camera"])
         weights = next((p for p in candidates if p.exists()), None)
         if a.sem_weights:
             weights = Path(a.sem_weights)
@@ -290,7 +348,7 @@ class PerceptionServer:
     def config_msg(self) -> dict:
         c = self.cfg
         return dict(type="config", source=self.source_kind, has_pose=self.has_pose, depth_mode=self.depth_mode,
-                    depth_modes=["metric", "relative"] + (["sim"] if self.source_kind == "sim" else []),
+                    depth_modes=["metric", "metric-indoor", "relative", "affine"] + (["sim"] if self.has_true_depth else []),
                     v_max=self.ncfg.v_max, w_max=self.ncfg.w_max, robot_radius=c.robot_radius,
                     grid=dict(x_min=c.x_min, x_max=c.x_max, y_min=c.y_min, y_max=c.y_max, res=c.res),
                     goal_frame="world" if self.has_pose else "robot", mode="auto" if self.mode_auto else "manual",
@@ -344,6 +402,13 @@ class PerceptionServer:
         elif (cfg.w, cfg.h) != (W, H):
             sx = W / cfg.w
             cfg.fx *= sx; cfg.fy *= sx; cfg.cx = W / 2; cfg.cy = H / 2; cfg.w, cfg.h = W, H
+        if hdr.get("dist"):
+            cfg.dist = tuple(float(v) for v in hdr["dist"])
+        # Rectify BEFORE anything reads geometry: backproject_optical is a pure pinhole
+        # model, so uncorrected barrel distortion bows the ground plane upward at the
+        # image edges and invents LETHAL cells along both sides of the path. A source
+        # that sends no coefficients (the simulator) is returned untouched.
+        bgr = pc.undistort(bgr, cfg)
         pose = None
         if self.has_pose and hdr.get("pose"):
             p = hdr["pose"]
@@ -354,7 +419,7 @@ class PerceptionServer:
         prof.lap("decode")
 
         # ---- depth ------------------------------------------------------------------
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)   # bgr is already rectified above
         warnings = []
         depth_mode = self.depth_mode
         if depth_mode == "sim":
@@ -367,11 +432,11 @@ class PerceptionServer:
                 depth = sim_depth
                 if depth.shape != (H, W):
                     depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
-                metric = True
+                metric, depth_arr_kind = True, "metric"
         if depth_mode != "sim":
             dm = self._depth_model(depth_mode)
             depth = dm(rgb, smooth=a.depth_smooth)
-            metric = dm.is_metric
+            metric, depth_arr_kind = dm.is_metric, dm.depth_kind
         prof.lap("depth")
 
         # ---- semantics --------------------------------------------------------------
@@ -380,10 +445,32 @@ class PerceptionServer:
         prof.lap("sem")
 
         # ---- costmap (self-calibrating) ---------------------------------------------
-        res = self.core.process(depth, sem_cost, depth_is_metric=metric)
+        res = self.core.process(depth, sem_cost, depth_is_metric=metric, depth_kind=depth_arr_kind)
         warnings += res.warnings
         grid = res.grid
         prof.lap("core")
+
+        # ---- visual odometry ----------------------------------------------------------
+        # Placed AFTER core.process because it needs this frame's fitted plane: the whole
+        # method is a bird's-eye warp through that plane, which is what makes the result
+        # metric without a stereo baseline or an IMU.
+        odo = None
+        if self.vo is not None:
+            if res.plane.ok:
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                ground = (sem_cost >= 0) & (sem_cost <= pc.GROUND_COST_MAX)
+                odo = self.vo.update(gray, cfg, res.plane, ground)
+                if odo.ok:
+                    self.pose_src.integrate(odo.dx, odo.dy, odo.dtheta, odo.confidence)
+                else:
+                    self.pose_src.miss()
+            else:
+                self.vo.reset()
+                self.pose_src.miss()
+            pose = self.pose_src.get()
+            if pose is None and odo is not None and not odo.ok and odo.why:
+                warnings.append(f"odometry: {odo.why}")
+        prof.lap("vo")
 
         # ---- navigation -------------------------------------------------------------
         out = self.nav.step(grid, pose)
@@ -406,6 +493,19 @@ class PerceptionServer:
             cam_small = cv2.resize(self.sem.overlay(bgr, labels, 0.35), (sw, int(sw * H / W)))
             depth_small = cv2.resize(pc.render_depth(depth, cfg.max_depth), (sw, int(sw * H / W)))
             self._thumbs = (b64img(cam_small, "jpeg", 70), b64img(depth_small, "jpeg", 65))
+        # Full-resolution views for the standalone MJPEG endpoints. These are the same
+        # arrays the dashboard gets as base64 thumbnails - encoded once more here at full
+        # size so /camera and /costmap can be opened in a bare browser tab, or pulled into
+        # OBS or a projector, with no dashboard and no WebSocket client.
+        def _jpg(img, q=80):
+            ok, b = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])
+            return b.tobytes() if ok else None
+        streams = {
+            "camera":  _jpg(bgr, 82),                                   # rectified, no overlay
+            "overlay": _jpg(self.sem.overlay(bgr, labels, 0.35), 80),    # + semantic classes
+            "depth":   _jpg(pc.render_depth(depth, cfg.max_depth), 78),
+            "costmap": _jpg(cm_img, 88),                                 # the final output
+        }
         images = dict(costmap=b64img(cm_img, "png"), camera=self._thumbs[0], depth=self._thumbs[1])
         glob = None
         if self.gmap is not None and pose is not None:
@@ -420,6 +520,8 @@ class PerceptionServer:
         prof.d["total"] = round(sum(prof.d.values()), 1)
 
         with self.lock:
+            self._streams = {k: v for k, v in streams.items() if v}
+            self._stream_seq = seq
             self.last_grid = grid
             self.last_pose = pose
             self.last_cmd = (v, w)
@@ -436,6 +538,10 @@ class PerceptionServer:
                     goal=self._goal_dict(), pose=None if pose is None else pose.as_dict(),
                     dist_to_goal=None if out.dist_to_goal is None else round(out.dist_to_goal, 2),
                     plane=plane, depth_mode=depth_mode, scale=round(res.scale, 3),
+                    odom=None if self.vo is None else dict(
+                        self.pose_src.as_dict(),
+                        tracked=0 if odo is None else odo.n_tracked,
+                        why="" if odo is None or odo.ok else odo.why),
                     local=dict(path_m=[[round(x, 2), round(y, 2)] for x, y in out.local_path_m[::2]], reached=out.reached,
                                grid=dict(x_min=cfg.x_min, x_max=cfg.x_max, y_min=cfg.y_min, y_max=cfg.y_max, res=cfg.res)),
                     **{"global": glob}, images=images, profile=prof.d, warnings=warnings, note=out.note,
@@ -446,6 +552,19 @@ class PerceptionServer:
         self.core.reset()
         for dm in self.depth_models.values():
             dm.prev = None
+        if self.vo is not None:
+            self.vo.reset()
+            self.pose_src.reset()
+        if self.source_kind == "rover" and not self.a.goal:
+            # pose starts at the origin facing +X, so this is "1.5 m straight ahead of
+            # wherever you were switched on" - a world goal that STAYS PUT as the rover
+            # drives, unlike the robot-frame carrot a pose-less source needs.
+            self.nav.set_goal(1.5, 0.0)
+        if not self.has_pose and not self.a.goal:
+            # A pose-less source plans towards a carrot in its OWN frame. nav.reset()
+            # clears it, so without this a rover that reconnects sits in NO_GOAL for
+            # ever, looking like a perception failure when nothing is actually wrong.
+            self.nav.set_goal(self.cfg.x_max - 1.0, 0.0)
 
     # -- websocket ------------------------------------------------------------------
     def _broadcast(self, msg: dict):
@@ -473,7 +592,7 @@ class PerceptionServer:
         try:
             async for m in ws:
                 if m.type == WSMsgType.BINARY:
-                    if self.source_kind != "sim":
+                    if not self.pushes_frames:
                         continue
                     try:
                         header, bgr, depth = parse_frame(m.data)
@@ -500,8 +619,8 @@ class PerceptionServer:
         if t == "hello":
             role = cmd.get("role", "viewer")
             self.clients[ws] = role
-            if role == "sim":
-                print(f"[server] sim connected ({cmd.get('client', '?')}): resetting map and goal")
+            if role in ("sim", "rover"):
+                print(f"[server] {role} connected ({cmd.get('client', '?')}): resetting map and goal")
                 self._reset()
             await ws.send_str(json.dumps(self.config_msg()))
             if self.last_nav_msg:
@@ -520,7 +639,7 @@ class PerceptionServer:
             await self._send_all(dict(type="goal", goal=None))
         elif t == "set_depth":
             mode = cmd.get("mode")
-            if mode in ("metric", "relative") or (mode == "sim" and self.source_kind == "sim"):
+            if mode in ("metric", "metric-indoor", "relative", "affine") or (mode == "sim" and self.has_true_depth):
                 self.depth_mode = mode
                 self.core.reset()
                 await self._send_all(self.config_msg())
@@ -554,6 +673,60 @@ class PerceptionServer:
             return web.json_response(rm.path_msg(pts, "map" if gpath else "base_link"))
         return web.json_response(dict(error=f"unknown or not ready: {what}"), status=404)
 
+    STREAMS = {
+        "costmap": "the final output - traversability grid, plan and drive command",
+        "camera":  "the rover's live camera, lens-rectified, no overlay",
+        "overlay": "camera + semantic segmentation classes",
+        "depth":   "depth, colour-mapped to max_depth",
+    }
+
+    async def mjpeg(self, request):
+        """One view as multipart/x-mixed-replace - a plain <img src> in any browser.
+
+        Deliberately NOT the dashboard: no WebSocket, no JavaScript, nothing to keep in
+        sync. Opening http://<host>:<port>/camera in a tab is enough, which also makes
+        these usable as a projector view or an OBS browser source during a demo.
+        Each client is served the newest processed frame and never a backlog, so a slow
+        viewer falls behind in quality of experience, never in latency.
+        """
+        what = request.match_info["what"]
+        if what not in self.STREAMS:
+            return web.json_response(dict(error=f"unknown stream {what}",
+                                          available=list(self.STREAMS)), status=404)
+        resp = web.StreamResponse(status=200, headers={
+            "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Connection": "close",
+        })
+        await resp.prepare(request)
+        last = -1
+        try:
+            while True:
+                with self.lock:
+                    seq, buf = self._stream_seq, self._streams.get(what)
+                if buf is not None and seq != last:
+                    last = seq
+                    await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
+                                     b"Content-Length: " + str(len(buf)).encode() +
+                                     b"\r\n\r\n" + buf + b"\r\n")
+                else:
+                    await asyncio.sleep(0.01)
+        except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+            pass            # viewer closed the tab; nothing to clean up
+        return resp
+
+    async def streams_index(self, request):
+        rows = "".join(
+            f'<li><a href="/{k}">/{k}</a> &mdash; {v}</li>' for k, v in self.STREAMS.items())
+        return web.Response(content_type="text/html", text=(
+            "<!doctype html><meta charset=utf-8><title>streams</title>"
+            "<style>body{font:15px/1.6 system-ui;margin:2rem;max-width:46rem}"
+            "a{color:#06c}code{background:#eee;padding:.1em .3em;border-radius:3px}</style>"
+            "<h2>Perception streams</h2><ul>" + rows + "</ul>"
+            "<p>Each is a plain MJPEG stream &mdash; open it in a tab, embed it with "
+            "<code>&lt;img src=\"/camera\"&gt;</code>, or point OBS at it. "
+            "The full dashboard is at <a href=\"/\">/</a>.</p>"))
+
     async def status(self, request):
         return web.json_response(dict(config=self.config_msg(), fps=self.fps, clients=len(self.clients),
                                       last=None if not self.last_nav_msg else {k: v for k, v in self.last_nav_msg.items() if k != "images"}))
@@ -575,13 +748,15 @@ class PerceptionServer:
         app.router.add_get("/", self.index)
         app.router.add_get("/ws", self.ws_handler)
         app.router.add_get("/status", self.status)
+        app.router.add_get("/streams", self.streams_index)
+        app.router.add_get("/{what:costmap|camera|overlay|depth}", self.mjpeg)
         app.router.add_get("/ros/{what}", self.ros)
         app.router.add_static("/dashboard", HERE / "dashboard")
 
         async def on_startup(app_):
             self.loop = asyncio.get_running_loop()
             self.worker.start()
-            if self.source_kind != "sim":
+            if not self.pushes_frames:
                 self.capture = CaptureSource(self.a.source, self.slot, size=(self.cfg.w, self.cfg.h),
                                              every=self.a.every, fps_cap=self.a.fps_cap)
                 self.capture.start()
@@ -597,15 +772,20 @@ class PerceptionServer:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", default="0", help="'sim' (frames pushed by SLAM3D), camera index, or video path")
-    ap.add_argument("--depth", default="metric", choices=["metric", "relative", "sim"],
-                    help="metric: Depth Anything V2 metric-outdoor (default); relative: + nominal-height scale; sim: renderer depth")
+    ap.add_argument("--source", default="0", help="'sim' (SLAM3D pushes frames), 'rover' (the Pi pushes frames), camera index, or video path")
+    ap.add_argument("--depth", default="metric", choices=["metric", "metric-indoor", "relative", "affine", "sim"],
+                    help="metric: Depth Anything V2 metric-outdoor (default); relative: 1/disp + nominal-height scale; "
+                         "affine: solve BOTH affine unknowns from ground planarity (best on a fixed low rig); sim: renderer depth")
     ap.add_argument("--rig", default="macbook", choices=list(pc.RIG_PRESETS), help="intrinsics preset for camera/video sources")
+    ap.add_argument("--dist", default=None, help="lens distortion 'k1,k2,p1,p2,k3' (camera/video sources; the rover sends its own)")
     ap.add_argument("--hfov", type=float, default=None, help="horizontal field of view in degrees (overrides --rig)")
     ap.add_argument("--height", type=float, default=None, help="LOCK camera height (m) instead of estimating it")
     ap.add_argument("--pitch", type=float, default=None, help="LOCK camera pitch (deg, nose-down positive)")
     ap.add_argument("--roll", type=float, default=None, help="LOCK camera roll (deg)")
-    ap.add_argument("--nominal-height", type=float, default=0.6, help="height used to scale RELATIVE depth")
+    ap.add_argument("--nominal-height", type=float, default=None,
+                    help="camera height (m) used to scale RELATIVE/AFFINE depth. Default 0.60 for a camera "
+                         "rig, 0.17 for --source rover. This one ruler measurement is what gives the whole "
+                         "map its metric scale.")
     ap.add_argument("--goal", default=None, help="initial goal 'x,y' (world if sim, robot frame otherwise)")
     ap.add_argument("--auto", action="store_true", help="start the sim in AUTO mode")
     ap.add_argument("--v-max", dest="v_max", type=float, default=None)

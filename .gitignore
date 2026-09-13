@@ -28,3 +28,6 @@ sim3d/dist/
 # scratch
 scratch/
 *.log
+
+# generated knowledge graph (graphify), regenerate with /graphify
+graphify-out/

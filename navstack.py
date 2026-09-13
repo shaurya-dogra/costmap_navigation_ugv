@@ -95,6 +95,70 @@ class NoPose(PoseSource):
         return None
 
 
+class VisualOdomPose(PoseSource):
+    """
+    Integrates frame-to-frame planar motion (see `ground_vo.GroundVO`) into a world pose.
+
+    The world frame is simply wherever the rover was when this was created or last reset,
+    facing along +X. That is enough for a global costmap and for world-frame goals: both
+    only need a frame that is CONSISTENT over a run, not one that is absolute.
+
+    This is dead reckoning over visual measurements, so error accumulates and is never
+    corrected - there is no loop closure here. `dist_travelled` is exposed so a consumer
+    can reason about how much drift has plausibly built up, and the pose is withheld
+    entirely (`get()` returns None) once too many consecutive frames have failed, so the
+    global map stops fusing rather than smearing itself against a stale pose.
+    """
+
+    def __init__(self, max_lost: int = 8):
+        self.pose = Pose(0.0, 0.0, 0.0)
+        self.max_lost = max_lost
+        self.lost = 0
+        self.started = False
+        self.dist_travelled = 0.0
+        self.confidence = 0.0
+
+    def reset(self):
+        self.pose = Pose(0.0, 0.0, 0.0)
+        self.lost = 0
+        self.started = False
+        self.dist_travelled = 0.0
+        self.confidence = 0.0
+
+    def integrate(self, dx: float, dy: float, dtheta: float, confidence: float = 1.0) -> Pose:
+        """Apply one robot-frame step. Translation happens in the heading held BEFORE the
+        turn, with a half-turn correction - a straight Euler step visibly curves short
+        arcs inward when a frame contains both translation and rotation."""
+        th = self.pose.theta + 0.5 * dtheta
+        c, s = math.cos(th), math.sin(th)
+        self.pose.x += dx * c - dy * s
+        self.pose.y += dx * s + dy * c
+        self.pose.theta = math.atan2(math.sin(self.pose.theta + dtheta),
+                                     math.cos(self.pose.theta + dtheta))
+        self.dist_travelled += math.hypot(dx, dy)
+        self.confidence = float(confidence)
+        self.lost = 0
+        self.started = True
+        return self.pose
+
+    def miss(self):
+        """One frame produced no usable motion estimate."""
+        self.lost += 1
+        self.confidence *= 0.7
+
+    def get(self):
+        if not self.started or self.lost > self.max_lost:
+            return None
+        return self.pose
+
+    def as_dict(self):
+        return dict(x=round(self.pose.x, 3), y=round(self.pose.y, 3),
+                    theta_deg=round(math.degrees(self.pose.theta), 1),
+                    dist=round(self.dist_travelled, 2),
+                    confidence=round(self.confidence, 2),
+                    lost=self.lost, ok=self.get() is not None)
+
+
 # ----------------------------------------------------------------------------
 # 2. global costmap
 # ----------------------------------------------------------------------------
@@ -487,7 +551,9 @@ class Navigator:
         dist = math.hypot(gx, gy)
         if dist <= ncfg.goal_tol:
             self.state = "ARRIVED"
-            return NavOutput("ARRIVED", 0.0, 0.0, dist_to_goal=dist, global_path=self.global_path)
+            return NavOutput("ARRIVED", 0.0, 0.0, dist_to_goal=dist, global_path=self.global_path,
+                             local_goal=local_goal_cell(cfg, float(np.clip(gx, cfg.x_min + cfg.res, cfg.x_max - cfg.res)),
+                                                        float(np.clip(gy, cfg.y_min + cfg.res, cfg.y_max - cfg.res))))
 
         # ---- global layer -----------------------------------------------------
         if self.gmap is not None and pose is not None:
@@ -498,6 +564,15 @@ class Navigator:
             cx, cy = carrot(self.global_path, pose, cfg, self.goal)
         else:
             cx, cy = gx, gy
+
+        # Where the carrot lands on the local grid. Computed HERE, before the turn-in-place
+        # branch, purely so every exit path can report it: the operator clicks a goal, the
+        # rover turns towards it, and if this were computed later the marker would vanish
+        # from the costmap for exactly as long as the turn lasts - which reads as "my
+        # click did nothing".
+        lx = float(np.clip(cx, cfg.x_min + cfg.res, cfg.x_max - cfg.res))
+        ly = float(np.clip(cy, cfg.y_min + cfg.res, cfg.y_max - cfg.res))
+        gcell = local_goal_cell(cfg, lx, ly)
 
         # ---- turn in place when the carrot is not in front of us ---------------
         bearing = math.atan2(cy, cx)
@@ -511,14 +586,11 @@ class Navigator:
             self.state = "TURNING"
             self._v_prev, self._w_prev = 0.0, 0.0
             w = float(np.clip(ncfg.turn_gain * bearing, -ncfg.w_max, ncfg.w_max))
-            return NavOutput("TURNING", 0.0, w, global_path=self.global_path, dist_to_goal=dist,
-                             note=f"bearing {math.degrees(bearing):+.0f} deg")
+            return NavOutput("TURNING", 0.0, w, local_goal=gcell, global_path=self.global_path,
+                             dist_to_goal=dist, note=f"bearing {math.degrees(bearing):+.0f} deg")
 
         # ---- local layer: A* to the carrot, pure pursuit ------------------------
-        lx = float(np.clip(cx, cfg.x_min + cfg.res, cfg.x_max - cfg.res))
-        ly = float(np.clip(cy, cfg.y_min + cfg.res, cfg.y_max - cfg.res))
         lcfg = _LocalCfg(cfg, ncfg, lx, ly)
-        gcell = local_goal_cell(cfg, lx, ly)
         path, reached = astar(local_grid, lcfg, goal=gcell)
         if not path:
             self._blocked += 1

@@ -127,6 +127,17 @@ class CoreCfg:
 
     # --- relative-depth fallback --------------------------------------------
     nominal_height: float = 0.60    # used only when depth carries no scale
+    bootstrap_pitch: Optional[float] = None   # radians, nose-down positive. Seeds the AFFINE
+                                    # solve on frame 1 only, before any plane has been
+                                    # fitted. NOT a lock: RANSAC overrides it immediately.
+    affine_depth: bool = False      # relative depth is affine, not just scaled: solve
+                                    # 1/Z = a*disp + b from ground planarity (see
+                                    # solve_affine_depth). Off = the old 1/disp + scale.
+
+    # --- lens ---------------------------------------------------------------
+    dist: tuple = ()                # OpenCV distortion coeffs (k1 k2 p1 p2 k3...).
+                                    # Empty = the frames are already rectified, which
+                                    # is true of the simulator and assumed of webcams.
 
     LETHAL: int = LETHAL
     UNKNOWN: int = UNKNOWN
@@ -152,11 +163,74 @@ def intrinsics_from_vfov(w: int, h: int, vfov_deg: float):
     return fy, fy, w / 2.0, h / 2.0
 
 
+def rover_cfg(w: int = 640, h: int = 480, hfov: float = 62.2, cam_height: float = 0.17,
+              robot_radius: float = 0.20, **over) -> "CoreCfg":
+    """
+    CoreCfg for a small UGV whose camera sits ~6-7 inches (0.15-0.18 m) up.
+
+    Defaults match the MEASURED rig: Raspberry Pi Camera v2 (IMX219) at 640x480 taken
+    from the FULL-FOV 1640x1232 sensor mode, whose optics are 62.2 x 48.8 degrees, so
+    fx = fy ~ 530. 4:3 is deliberate, not incidental: the binding constraint here is how
+    many ground rows the sensor gets, and vertical FOV is what buys them - cropping to
+    16:9 would throw away a third of the ground for nothing.
+
+    WARNING: asking picamera2 for a 640x480 SENSOR mode selects a 1280x960 crop of the
+    array (39 % of its width), collapsing the field of view to ~26.5 degrees and halving
+    the map's width with no error anywhere. Always pin
+    `sensor={"output_size": (1640, 1232)}`. See rover_agent.py.
+
+    WHY THESE NUMBERS AND NOT THE DEFAULTS
+    --------------------------------------
+    Ground samples thin out as `stride * r^2 / (fy * cam_height)` (the same expression
+    the hole rule uses). At 0.17 m and fy ~ 530 the spacing is 1.1 cm at 1 m, 4.4 cm at
+    2 m and 18 cm at 4 m: the whole of 3-8 m lands in about a dozen pixel rows, where
+    one pixel of error is a quarter-metre of range. An 8 m map at this mount height is
+    not sparse, it is fiction. So:
+
+      x_max 2.6 m    honest sensing horizon. At 0.8 m/s with 200 ms of link latency
+                     and 1 m/s^2 braking the rover stops in 0.5 m - a 5x margin.
+                     Everything beyond this comes from the fused map, not this frame.
+      res 0.05       a 0.25 m chassis cannot be planned for on a 0.10 m grid.
+      obstacle_h     0.10 m: a rover this size is stopped by what a car drives over.
+      ditch_h        -0.08 m, and plane_gate_max must stay under it, so the inlier
+                     band tightens from 0.10 to 0.05.
+      stride 1       at stride 2 the hole rule's own sampling gate switches negative
+                     obstacles off at 2.2 m - inside the driving envelope.
+      plane_near*    fit the ground the rover is about to cross (1.5 m), not 5 m of
+                     mostly-empty horizon.
+
+    `obstacle_h` is deliberately 0.10 and not the 0.06 the chassis would like: with
+    monocular depth the plane residual is 5-8 cm at 2 m, so a 6 cm threshold would
+    fire on noise. Stereo (2.4 cm at 2 m) is what buys the lower number.
+    """
+    fx, fy, cx, cy = intrinsics_from_hfov(w, h, hfov)
+    base = dict(
+        w=w, h=h, fx=fx, fy=fy, cx=cx, cy=cy,
+        x_min=0.20, x_max=2.60, y_min=-1.30, y_max=1.30, res=0.05,
+        min_depth=0.10, max_depth=4.0, stride=1,
+        obstacle_h=0.10, ditch_h=-0.08, max_obstacle_h=0.80,
+        ditch_max_range=2.50, hole_max_range=2.60, hole_min_cells=4,
+        min_cell_pts=3, geo_min_pts=2, robot_radius=robot_radius,
+        plane_near_range=1.50, plane_max_range=2.50,
+        plane_lower_frac=0.55, plane_fallback_frac=0.35, plane_min_pts=300,
+        plane_gate=0.02, plane_gate_rel=0.01, plane_gate_max=0.05,
+        plane_max_pitch_deg=45.0, plane_min_height=0.05, plane_max_height=1.0,
+        nominal_height=cam_height, affine_depth=False,
+        bootstrap_pitch=math.radians(12.0),   # the recommended mount tilt; seeds frame 1 only
+    )
+    base.update(over)
+    return CoreCfg(**base)
+
+
 RIG_PRESETS = {
     # hfov is a starting point; run calibrate.py for exact numbers.
     "macbook": dict(hfov=78.0),
     "phone":   dict(hfov=68.6),   # fx = 940 at 1280 px
     "sim":     dict(hfov=None),   # exact intrinsics arrive in every frame header
+    # A UGV camera sits ~0.17 m up, so ground samples thin out as r^2/(fy*h): a wide
+    # lens throws away the range resolution the low mount already made scarce. 60 deg
+    # still spans +/-1.4 m at 2.5 m, far more than a 0.25 m chassis needs.
+    "rover":   dict(hfov=60.0),
 }
 
 
@@ -243,6 +317,50 @@ def backproject_optical(depth: np.ndarray, cfg: CoreCfg, stride: int):
     xn, yn, rows = pixel_rays(cfg, stride)
     z = depth[::stride, ::stride].astype(np.float32)
     return xn * z, yn * z, z, rows
+
+
+class Undistorter:
+    """
+    Pinhole is a lie on a real lens. `backproject_optical` assumes straight lines stay
+    straight, so barrel distortion bends the ground plane upward towards the image
+    edges and manufactures LETHAL cells along both sides of the path. Rectify once, up
+    front, and every equation downstream becomes true again.
+
+    Maps are built once per (size, K, dist) and reused; an empty `dist` is a no-op, so
+    the simulator and any already-rectified source pay nothing.
+    """
+
+    def __init__(self, w: int, h: int, K: np.ndarray, dist: np.ndarray):
+        self.w, self.h = w, h
+        self.K = np.asarray(K, np.float64).reshape(3, 3)
+        self.dist = np.asarray(dist, np.float64).ravel()
+        # newCameraMatrix = K keeps the intrinsics the rest of the pipeline already
+        # holds; alpha is irrelevant because we are not changing K.
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(
+            self.K, self.dist, None, self.K, (w, h), cv2.CV_16SC2)
+
+    def __call__(self, img: np.ndarray) -> np.ndarray:
+        return cv2.remap(img, self.map1, self.map2, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT)
+
+
+_UNDISTORT_CACHE: dict = {}
+
+
+def undistort(img: np.ndarray, cfg: CoreCfg) -> np.ndarray:
+    """Rectify `img` for cfg's intrinsics + distortion. No coeffs -> returned as is."""
+    if not len(cfg.dist) or not np.any(np.asarray(cfg.dist, np.float64)):
+        return img
+    h, w = img.shape[:2]
+    key = (w, h, cfg.fx, cfg.fy, cfg.cx, cfg.cy, tuple(np.round(np.asarray(cfg.dist, float), 8)))
+    u = _UNDISTORT_CACHE.get(key)
+    if u is None:
+        K = np.array([[cfg.fx, 0, cfg.cx], [0, cfg.fy, cfg.cy], [0, 0, 1]], np.float64)
+        u = Undistorter(w, h, K, np.asarray(cfg.dist, np.float64))
+        if len(_UNDISTORT_CACHE) > 4:
+            _UNDISTORT_CACHE.clear()
+        _UNDISTORT_CACHE[key] = u
+    return u(img)
 
 
 # ----------------------------------------------------------------------------
@@ -518,6 +636,181 @@ def cfg_hold(cfg: CoreCfg) -> int:
     return cfg.plane_hold_frames * 2
 
 
+def solve_affine_depth(disp: np.ndarray, sem_cost: np.ndarray, cfg: CoreCfg,
+                       plane: "Optional[Plane]" = None, height: Optional[float] = None,
+                       stride: int = 4, iters: int = 3, min_pts: int = 400):
+    """
+    Recover METRIC depth from a relative Depth Anything disparity map.
+
+    THE PROBLEM
+    -----------
+    Relative Depth Anything is affine-invariant in DISPARITY: true inverse depth is
+    `1/Z = a*disp + b` for a scale `a` and a shift `b` the network never reports. Taking
+    `Z = 1/disp` silently assumes `b == 0`; when it is not, the cloud is WARPED, not
+    merely mis-scaled, and no rescaling repairs it.
+
+    WHY FLATNESS ALONE CANNOT FIX IT  (measured, not assumed)
+    ---------------------------------------------------------
+    The obvious idea is to solve both unknowns from the ground being flat. For a point
+    on a plane `n.P + d = 0`, with ray `r = (xn, yn, 1)` and `m = -n/d`:
+
+        a*disp + b  =  m_x*xn + m_y*yn + m_z
+
+    which looks like a linear homogeneous system in (a, b, m_x, m_y, m_z). It is - but
+    it is RANK DEFICIENT BY CONSTRUCTION. The column multiplying `b` is all +1 and the
+    column multiplying `m_z` is all -1, so `(0, 1, 0, 0, 1)` is an exact null direction:
+    adding the same delta to `b` and to `m_z` changes nothing. On real data the design
+    matrix has TWO vanishing singular values and the SVD returns that trivial direction.
+
+    Physically: on coplanar points, a constant added to inverse depth is
+    indistinguishable from the plane sitting at a different distance. Only the
+    combination `c = m_z - b` is observable. Worse, the degeneracy survives the obvious
+    remedy - imposing a known camera height `|m| = 1/h` supplies one equation for the
+    two remaining unknowns, leaving a one-parameter family.
+
+    So the shift is NOT recoverable from flat ground, with or without a tape measure.
+
+    WHAT DOES WORK
+    --------------
+    Fix the plane's ORIENTATION independently and the rest follows. Given a known
+    normal `n` and height `h`, `m = -n/h` is fully determined, and
+
+        a*disp + b = m.r
+
+    is then an ordinary two-unknown least squares over the ground pixels. Sources for
+    that orientation, in increasing order of quality:
+
+      * the previous frame's fitted plane (what `PerceptionCore` passes) - the plane
+        moves slowly, so last frame's estimate is a good constraint for this one;
+      * the measured mount pitch, as the bootstrap seed on the very first frame;
+      * an IMU gravity vector - per-frame, assumption-free (see the UpReference plan);
+      * SLAM map points, which are NOT coplanar and so determine (a, b) outright.
+
+    CAUTION - THIS IS A FIXED POINT, MEASURED
+    -----------------------------------------
+    Feeding back the previous frame's plane makes the loop SELF-CONFIRMING: seeded at
+    12 deg against a true 10 deg, the estimate sits at 12.79 deg for as many iterations
+    as you care to run and never migrates toward the truth. The solve forces the ground
+    onto whatever orientation it was handed, and RANSAC then rediscovers that same
+    orientation. `a` does converge (0.693 against a true 0.700); the orientation and `b`
+    do not.
+
+    So this path is only trustworthy when the orientation comes from something that
+    cannot be biased by the depth itself - an IMU gravity vector, or non-coplanar SLAM
+    map points. Until one of those exists, prefer `kind="metric"`: on the same synthetic
+    scene it recovers pitch and height exactly, where `1/disp` loses the plane entirely
+    (h = 0.000, pitch = 0.00). That is why `rover_cfg` ships `affine_depth=False`.
+
+    Returns `(a, b, info)`; depth is `1/(a*disp + b)`. Returns `(None, None, info)` when
+    no orientation constraint is supplied or the fit is implausible - the caller then
+    falls back and says so, rather than silently trusting a degenerate solve.
+    """
+    info: dict = {"n_pts": 0, "residual": float("nan"), "why": ""}
+
+    if plane is None or not plane.ok:
+        info["why"] = ("no plane constraint: the affine shift is unidentifiable from "
+                       "coplanar points alone (see docstring)")
+        return None, None, info
+    h = float(height if height is not None else plane.d)
+    if not (1e-3 < h < 100.0):
+        info["why"] = f"implausible height constraint {h}"
+        return None, None, info
+
+    d = disp[::stride, ::stride].astype(np.float64)
+    sc = sem_cost[::stride, ::stride]
+    xn, yn, rows = pixel_rays(cfg, stride)
+    xn, yn = xn.astype(np.float64), yn.astype(np.float64)
+
+    m = np.isfinite(d) & (d > 1e-6)
+    m &= rows >= (1.0 - cfg.plane_lower_frac) * cfg.h
+    ground = m & (sc >= 0) & (sc <= GROUND_COST_MAX)
+    if ground.sum() < min_pts:
+        ground = m & (rows >= (1.0 - cfg.plane_fallback_frac) * cfg.h)
+        info["why"] = "semantic ground too small; fell back to lower-image prior"
+    if ground.sum() < min_pts:
+        info["why"] = f"only {int(ground.sum())} ground candidates (< {min_pts})"
+        return None, None, info
+
+    D, XN, YN = d[ground], xn[ground], yn[ground]
+    info["n_pts"] = int(D.size)
+
+    # orientation is GIVEN, so m is fully determined and only (a, b) remain
+    mv = -np.asarray(plane.n, np.float64) / h
+    target = mv[0] * XN + mv[1] * YN + mv[2]
+
+    keep = np.ones(D.size, bool)
+    a = b = 0.0
+    for _ in range(max(1, iters)):
+        A = np.stack([D[keep], np.ones(int(keep.sum()))], axis=1)
+        sol, *_ = np.linalg.lstsq(A, target[keep], rcond=None)
+        a, b = float(sol[0]), float(sol[1])
+        resid = np.abs(a * D + b - target)
+        cut = np.quantile(resid, 0.80)      # obstacles are outliers to a plane
+        keep = resid <= max(cut, 1e-9)
+        if keep.sum() < min_pts // 2:
+            break
+
+    if a <= 0:
+        info["why"] = f"degenerate solve (a={a:.4g} <= 0): disparity carries no depth signal"
+        return None, None, info
+    inv = a * D + b
+    good = inv > 1e-6
+    if good.mean() < 0.5:
+        info["why"] = f"only {good.mean():.0%} of ground pixels solve to positive depth"
+        return None, None, info
+    med = float(np.median(1.0 / inv[good]))
+    if not (0.2 <= med <= cfg.max_depth):
+        info["why"] = f"implausible median ground depth {med:.1f} m"
+        return None, None, info
+
+    info["residual"] = float(np.median(np.abs(a * D + b - target)))
+    info["height"] = round(h, 3)
+    info["pitch_deg"] = round(math.degrees(plane.pitch), 2)
+    info["median_ground_depth"] = round(med, 2)
+    info["source"] = plane.source
+    return float(a), float(b), info
+
+
+def depth_from_affine(disp: np.ndarray, a: float, b: float, cfg: CoreCfg) -> np.ndarray:
+    """Apply a `solve_affine_depth` solution. Non-positive inverse depth -> 0 (invalid)."""
+    inv = a * disp.astype(np.float32) + b
+    out = np.zeros_like(inv, dtype=np.float32)
+    ok = inv > 1e-6
+    out[ok] = 1.0 / inv[ok]
+    return out
+
+
+def pixel_to_ground(u: float, v: float, cfg: CoreCfg, plane: Plane):
+    """
+    A clicked pixel -> the metric point on the GROUND it refers to, in the robot frame.
+
+    This is how a destination is named outdoors when there is no map and no GPS: the
+    operator points at a patch of ground in the live view and the ray through that
+    pixel is intersected with the plane that was just fitted to the real ground. No
+    localisation, no prior map, no survey - only the geometry already measured this
+    frame.
+
+    Returns `(x_forward, y_left)` in metres, or None when the ray never meets the
+    ground (at or above the horizon, or the plane is not currently known).
+    """
+    if plane is None or not plane.ok:
+        return None
+    r = np.array([(float(u) - cfg.cx) / cfg.fx, (float(v) - cfg.cy) / cfg.fy, 1.0])
+    nr = float(np.dot(plane.n, r))
+    # plane.n points UP and plane.d > 0, so a downward ray has n.r < 0. Anything else
+    # points at or above the horizon and has no ground intersection in front of us.
+    if nr > -1e-4:
+        return None
+    t = -plane.d / nr
+    if not np.isfinite(t) or t <= 0:
+        return None
+    P = t * r
+    R = plane.R
+    x = float(R[0] @ P)
+    y = float(R[1] @ P)
+    return x, y
+
+
 def to_ground_frame(Xc, Yc, Zc, plane: Plane):
     """Optical points -> robot frame (X fwd, Y left, Z above ground)."""
     R = plane.R
@@ -682,6 +975,8 @@ class CoreResult:
     timing_ms: dict = field(default_factory=dict)
     n_points: int = 0
     warnings: list = field(default_factory=list)
+    depth_kind: str = "metric"
+    affine: Optional[dict] = None      # solve_affine_depth() diagnostics, when used
 
 
 class PerceptionCore:
@@ -702,14 +997,55 @@ class PerceptionCore:
     def reset(self):
         self.planes.reset()
 
-    def process(self, depth: np.ndarray, sem_cost: np.ndarray, depth_is_metric: bool = True) -> CoreResult:
+    def process(self, depth: np.ndarray, sem_cost: np.ndarray, depth_is_metric: bool = True,
+                depth_kind: Optional[str] = None) -> CoreResult:
+        """
+        `depth_kind` overrides the `depth_is_metric` flag and selects how `depth` is read:
+
+          "metric"    : already metres (simulator, stereo, metric Depth Anything)
+          "scaled"    : unscaled depth; the fitted plane rescales it to nominal_height
+          "disparity" : RAW disparity from relative Depth Anything. Both the affine
+                        scale AND shift are solved from ground planarity first
+                        (solve_affine_depth), because 1/disp alone warps the cloud.
+
+        The default keeps the old two-valued behaviour, so existing callers are
+        unaffected.
+        """
         cfg = self.cfg
         t0 = time.perf_counter()
+        if depth_kind is None:
+            depth_kind = "metric" if depth_is_metric else "scaled"
         if depth.shape != (cfg.h, cfg.w):
             depth = cv2.resize(depth, (cfg.w, cfg.h), interpolation=cv2.INTER_NEAREST)
         if sem_cost.shape != (cfg.h, cfg.w):
             sem_cost = cv2.resize(sem_cost.astype(np.float32), (cfg.w, cfg.h),
                                   interpolation=cv2.INTER_NEAREST)
+
+        affine_info = None
+        pre_warn = []
+        if depth_kind == "disparity":
+            # The affine SHIFT is unidentifiable from flat ground alone (see
+            # solve_affine_depth), so the solve needs the plane's orientation from
+            # somewhere else. Last frame's fit is the natural source - the plane moves
+            # slowly - with the measured mount pitch seeding the very first frame.
+            seed = self.planes.prev
+            if (seed is None or not seed.ok) and cfg.bootstrap_pitch is not None:
+                seed = Plane(n=normal_from_angles(cfg.bootstrap_pitch, 0.0),
+                             d=cfg.nominal_height, confidence=0.0, ok=True, source="bootstrap")
+            a, b, affine_info = solve_affine_depth(depth, sem_cost, cfg, plane=seed,
+                                                   height=cfg.nominal_height)
+            if a is None:
+                # 1/disp is geometrically wrong but monotonic in range, so the plane
+                # estimator still has something to chew on; say so loudly, never pretend.
+                pre_warn.append("affine depth solve failed: " + str(affine_info.get("why", "?")))
+                depth = 1.0 / np.maximum(depth.astype(np.float32), 1e-3)
+                depth_kind = "scaled"
+            else:
+                depth = depth_from_affine(depth, a, b, cfg)
+                affine_info = dict(affine_info, a=round(a, 6), b=round(b, 6))
+                depth_kind = "metric"
+        depth_is_metric = depth_kind == "metric"
+
         s = cfg.stride
         Xc, Yc, Zc, rows = backproject_optical(depth, cfg, s)
         sc = sem_cost[::s, ::s]
@@ -721,7 +1057,7 @@ class PerceptionCore:
 
         plane = self.planes.estimate(Xc, Yc, Zc, sc, valid, rows)
         scale = 1.0
-        warnings = []
+        warnings = list(pre_warn)
         if plane.ok and not depth_is_metric:
             scale = cfg.nominal_height / max(plane.d, 1e-3)
             Xc, Yc, Zc = Xc * scale, Yc * scale, Zc * scale
@@ -735,7 +1071,7 @@ class PerceptionCore:
             grid = np.full((cfg.nx, cfg.ny), cfg.UNKNOWN, np.uint8)
             warnings.append("ground plane lost: map is UNKNOWN")
             return CoreResult(grid=grid, plane=plane, scale=scale, n_points=int(valid.sum()),
-                              warnings=warnings,
+                              warnings=warnings, depth_kind=depth_kind, affine=affine_info,
                               timing_ms=dict(backproject=(t1 - t0) * 1e3, plane=(t2 - t1) * 1e3, costmap=0.0))
 
         if plane.confidence < cfg.plane_low_conf:
@@ -747,7 +1083,7 @@ class PerceptionCore:
         grid = build_costmap(X, Y, Z, sc, valid, cfg, cam_height=plane.height)
         t3 = time.perf_counter()
         return CoreResult(grid=grid, plane=plane, scale=scale, n_points=int(valid.sum()),
-                          warnings=warnings,
+                          warnings=warnings, depth_kind=depth_kind, affine=affine_info,
                           timing_ms=dict(backproject=(t1 - t0) * 1e3, plane=(t2 - t1) * 1e3,
                                          costmap=(t3 - t2) * 1e3))
 
@@ -838,20 +1174,32 @@ class DepthModel:
 
       kind="metric"   : ...-Metric-Outdoor-Small-hf, output in metres (default)
       kind="relative" : ...-Small-hf, output is disparity; returns 1/disp (unscaled)
+      kind="affine"   : the same relative weights, but returns the RAW disparity so
+                        PerceptionCore can solve BOTH affine unknowns from ground
+                        planarity (solve_affine_depth). Preferred on a fixed rig: the
+                        metric models are trained on car-height driving scenes and
+                        hold neither scale nor shape at a 0.17 m mount.
 
-    `is_metric` tells PerceptionCore whether to trust the scale.
+    `is_metric` tells PerceptionCore whether to trust the scale; `is_disparity` tells
+    it the array is disparity, not depth.
     """
     MODELS = {
         "metric": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
         "metric-indoor": "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
         "relative": "depth-anything/Depth-Anything-V2-Small-hf",
+        "affine": "depth-anything/Depth-Anything-V2-Small-hf",
     }
+    #: what PerceptionCore.process should be told about each kind's output
+    DEPTH_KIND = {"metric": "metric", "metric-indoor": "metric",
+                  "relative": "scaled", "affine": "disparity"}
 
     def __init__(self, kind: str = "metric", device: Optional[str] = None, res: int = 336):
         import torch
         from transformers import AutoImageProcessor, AutoModelForDepthEstimation
         self.kind = kind
         self.is_metric = kind.startswith("metric")
+        self.is_disparity = kind == "affine"
+        self.depth_kind = self.DEPTH_KIND.get(kind, "metric")
         self.device = device or pick_device()
         name = self.MODELS[kind]
         self.proc = AutoImageProcessor.from_pretrained(name, size={"height": res, "width": res})
@@ -867,7 +1215,7 @@ class DepthModel:
             z = torch.nn.functional.interpolate(z[:, None].float(), size=rgb.shape[:2],
                                                 mode="bilinear", align_corners=False)[0, 0]
             out = z.cpu().numpy()
-        if not self.is_metric:
+        if not self.is_metric and not self.is_disparity:
             out = 1.0 / np.maximum(out, 1e-3)
         if smooth > 0 and self.prev is not None and self.prev.shape == out.shape:
             out = smooth * self.prev + (1 - smooth) * out

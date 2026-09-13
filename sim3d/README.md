@@ -68,3 +68,12 @@ src/components/MiniMap.jsx       clickable, expandable course map
 Frames: nav `x = −three.z`, `y = −three.x`, `θ = heading` (left = positive). The
 camera's pose sent to the server is the ground point under the lens.
 Wire protocol: `PROTOCOL.md` in the perception repo.
+
+## Note: this simulator is one of three sources
+
+`perception_server.py` now also accepts `--source rover` (a real Pi pushing frames, see
+`rover_agent.py` and `ROVER_PLAN.md`) and a local webcam. The server branches on
+capability flags — `pushes_frames`, `has_true_depth`, `has_pose`, `is_vehicle` — rather
+than on the source name, and this simulator is the only source that declares
+`has_true_depth` and `has_pose`. Nothing in the sim path changed when the rover source
+was added, and the test suites guard that.

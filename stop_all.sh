@@ -22,6 +22,20 @@ stop() {   # stop <label> <pgrep pattern>
 
 echo "stopping the demo..."
 stop "perception server"      "perception_server.py"
+
+# The rover agent runs on the Pi, not here, so pgrep cannot see it. Reach across and
+# stop it too - otherwise it sits in its reconnect loop hammering a dead server.
+PI="${PI:-rikshaw@10.218.135.132}"
+if ssh -o BatchMode=yes -o ConnectTimeout=4 "$PI" true 2>/dev/null; then
+  if ssh -o BatchMode=yes "$PI" 'pgrep -f "[r]over_agent" >/dev/null' 2>/dev/null; then
+    ssh -o BatchMode=yes "$PI" 'pkill -f "[r]over_agent" || true' 2>/dev/null || true
+    echo "  rover agent ($PI): stopped"
+  else
+    echo "  rover agent ($PI): not running"
+  fi
+else
+  echo "  rover agent ($PI): unreachable, skipped"
+fi
 stop "rover sim (vite)"        "vite --port|vite.js --port|node_modules/.bin/vite"
 stop "legacy costmap windows"  "costmap_prototype.py"
 stop "headless chrome (tests)" "remote-debugging-port=9222"

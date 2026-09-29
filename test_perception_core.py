@@ -200,6 +200,34 @@ check("left obstacle draws on screen LEFT", f"L={L} R={R_}", L > R_ and img.dtyp
 ix, iy = pc.px_to_cell(*pc.cell_to_px(10, 20, cfg.nx, cfg.ny, 4), cfg.nx, cfg.ny, 4)
 check("cell_to_px / px_to_cell round trip", f"{(ix, iy)}", (ix, iy) == (10, 20))
 
+print("\n10b. IMPLAUSIBLE CAMERA HEIGHT (metric depth read a 10 cm FPV camera as 2.5 m up)")
+depth, sem = synth(mk_cfg(), 0.6, math.radians(12), 0.0, boxes=[(4.0, 4.6, -0.4, 0.4, 0.0, 0.9)])
+r_def, _ = run(mk_cfg(), depth, sem)
+r_ok, _ = run(mk_cfg(plane_plausible=(0.2, 1.8)), depth, sem)
+r_bad, _ = run(mk_cfg(plane_plausible=(0.03, 0.3)), depth, sem)
+check("no rig bound (default): the map is built as before", f"h {r_def.plane.height:.2f} m, known {np.mean(r_def.grid != pc.UNKNOWN):.0%}",
+      np.mean(r_def.grid != pc.UNKNOWN) > 0.2)
+check("height inside the rig bound: identical map", "same grid" if np.array_equal(r_ok.grid, r_def.grid) else "differs",
+      np.array_equal(r_ok.grid, r_def.grid))
+check("height outside the rig bound: map is all UNKNOWN, and says why", f"known {np.mean(r_bad.grid != pc.UNKNOWN):.0%}, '{r_bad.warnings[-1][:48]}'",
+      (r_bad.grid == pc.UNKNOWN).all() and "implausible" in r_bad.warnings[-1])
+
+print("\n10c. EGO MASK: GROUND HIDDEN BY OUR OWN WHEELS IS OCCLUDED, NOT A HOLE")
+import cv2
+cfg_e = pc.rover_cfg(w=640, h=360, hfov=78.0, cam_height=0.10, robot_radius=0.15)
+depth, sem = synth(cfg_e, 0.10, math.radians(3), 0.0)
+ego = np.zeros((360, 640), np.uint8)                      # an FPV RC car: bonnet + two wheels
+cv2.fillPoly(ego, [np.array([(175, 360), (280, 246), (360, 246), (465, 360)], np.int32)], 1)
+cv2.ellipse(ego, (150, 305), (100, 80), 0, 0, 360, 1, -1); cv2.ellipse(ego, (490, 305), (100, 80), 0, 0, 360, 1, -1)
+ego[340:] = 1
+sem_e = np.where(ego > 0, -1, sem).astype(sem.dtype)
+r_hole, _ = run(cfg_e, depth, sem_e)
+cfg_e.ego_mask = ego > 0
+r_occ, _ = run(cfg_e, depth, sem_e)
+n_hole, n_occ = int((r_hole.raw == pc.LETHAL).sum()), int((r_occ.raw == pc.LETHAL).sum())
+check("flat ground + masked wheels, no occlusion rule: phantom holes", f"{n_hole} lethal cells", n_hole > 0)
+check("   ...with cfg.ego_mask: the flat ground stays free", f"{n_occ} lethal cells", n_occ == 0)
+
 print("\n11. THROUGHPUT (CPU, 1280x720)")
 cfg_big = mk_cfg(1280, 720)
 depth, sem = synth(cfg_big, 0.6, math.radians(12), 0.0, boxes=[(4.0, 4.6, -0.4, 0.4, 0.0, 0.9)])

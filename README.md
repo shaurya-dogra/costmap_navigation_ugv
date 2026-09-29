@@ -1,15 +1,116 @@
-# Vision-Based Autonomous Navigation for an Outdoor UGV — SIH PS 26126
+<div align="center">
 
-> **Camera in → traversability costmap → Nav2-style planning → wheel commands out.**
->
-> Perception AI for a ground robot in a GPS-denied outdoor environment. A single
-> camera feed becomes a metric, self-calibrating top-down costmap; a global + local
-> planner turns the costmap into `(v, ω)` drive commands. Runs against a Three.js
-> rover simulation (the rover drives itself to a destination you click), against
-> the MacBook webcam placed on the ground, and against a real Raspberry Pi rover
-> streaming its camera over Wi-Fi.
+# 🛰️ Your Bot, Our Navigation
+
+### Vision-only autonomous navigation for an outdoor UGV · SIH 2026 · PS 26126
+
+**One camera in → a metric traversability costmap → a safe `(v, ω)` drive command out.**
+No GPS. No LiDAR. The camera's height, pitch and roll are *measured every frame*, not configured.
+
+![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-MPS%20%7C%20CUDA-EE4C2C?logo=pytorch&logoColor=white)
+![OpenCV](https://img.shields.io/badge/OpenCV-5-5C3EE8?logo=opencv&logoColor=white)
+![Tests](https://img.shields.io/badge/automated%20checks-185%20passing-2ea44f)
+![Hardware](https://img.shields.io/badge/runs%20on-Raspberry%20Pi%204B%20rover-C51A4A?logo=raspberrypi&logoColor=white)
+![Nav2](https://img.shields.io/badge/messages-ROS%202%20Nav2%20shaped-22314E?logo=ros&logoColor=white)
+
+**Team AIT_WINTERBREAKERS** · Team ID 136814 · Theme: Smart Automation
+
+<img src="docs/media/trail.gif" width="92%" alt="The stack following a forest trail: camera with the costmap projected onto the ground, local costmap, plan and drive command">
+
+*Real off-road footage, processed frame by frame by our unmodified server code. The ground is tinted by the cost of the cell it falls in; the cyan ribbon is the robot's planned footprint.*
+
+### ▶ [Watch the 86-second demo](docs/media/demo_720p.mp4)
+
+</div>
 
 ---
+
+## ✨ What it does
+
+| The problem statement asks for… | What we built | Where |
+|---|---|---|
+| **1. Path detection**: safe paths vs. rocks, ditches, trees | Depth + semantics + a ground plane fitted **every frame** → 5–10 cm costmap. Ditches it cannot see into become obstacles; unmeasured ground is **never** free | [`perception_core.py`](perception_core.py) |
+| **2. Visual localisation** without GPS | Ground-plane visual odometry: a bird's-eye warp through the fitted plane gives motion **in metres**, no scale drift from the mono camera | [`ground_vo.py`](ground_vo.py) |
+| **3. Collision avoidance** toward a destination | Global costmap with memory, A\* / D\* Lite route, local A\* + pure pursuit replanned every frame, explicit BLOCKED / LOST / recovery states | [`navstack.py`](navstack.py), [`dstar_lite.py`](dstar_lite.py) |
+| Wheel / motor commands | `(v, ω)` as a ROS `Twist`, plus `OccupancyGrid`, `Odometry`, `Path`, all JSON over WebSocket (rosbridge-ready) | [`ros_msgs.py`](ros_msgs.py) |
+
+<table>
+<tr>
+<td width="50%"><img src="docs/media/vehicle.gif" alt="Another RC car enters the corridor: the plan bends and the robot crawls"><br><b>Another vehicle on the road:</b> the plan bends, slows or crawls, then resumes when the ground ahead is measured free again.</td>
+<td width="50%"><img src="docs/media/blind.gif" alt="Camera buried in grass: no ground plane, map is unknown, STOP"><br><b>Camera buried in grass:</b> no visible ground → no plane → the map is UNKNOWN → <b>STOP</b>. It never drives on a guess.</td>
+</tr>
+</table>
+
+## 🖼️ The pipeline, stage by stage
+
+<table>
+<tr>
+<td width="33%"><img src="docs/media/1_depth_map.jpg" alt="Depth map"><br><b>1 · Depth</b>: Depth Anything V2 on one RGB camera (stereo drops into the same interface).</td>
+<td width="33%"><img src="docs/media/2_semantic_segmentation.jpg" alt="Semantic segmentation"><br><b>2 · Semantics</b>: YOLO26 · ADE20K, 150 classes mapped to terrain cost. Geometry can veto a wrong label.</td>
+<td width="33%"><img src="docs/media/3_local_costmap.jpg" alt="Local costmap"><br><b>3 · Local costmap</b>: free / rough / obstacle / clearance / unknown in the robot frame, with the plan and footprint.</td>
+</tr>
+<tr>
+<td width="33%"><img src="docs/media/4_localisation.jpg" alt="Localisation"><br><b>4 · Localisation</b>: ground-plane visual odometry, 23 m of forest trail tracked with the pose valid on 99% of frames.</td>
+<td width="33%"><img src="docs/media/5_map.jpg" alt="Map"><br><b>5 · Map</b>: every frame's ground points placed by the VO pose, textured and as height above ground.</td>
+<td width="33%"><img src="docs/media/6_global_costmap.jpg" alt="Global costmap"><br><b>6 · Global costmap</b>: local maps fused in the world frame; one noisy frame cannot wall off the trail.</td>
+</tr>
+</table>
+
+## 📏 Measured, not claimed
+
+| | Result |
+|---|---|
+| **Real rover** (Raspberry Pi 4B + one Pi camera → laptop over Wi-Fi) | **~107 ms** camera → command, **10–12 fps**. The Pi captures at 30.7 fps, so the link is the limit, not the camera |
+| **17 min of real off-road FPV footage** (3,100 frames: grass, dirt trail, asphalt, gravel, culvert, weeds) | Ground plane fitted on **94%** of frames |
+| **Visual odometry**, 23 m forest trail, full frame rate | Pose valid on **99%** of frames, no GPS / IMU / encoders |
+| **Driving on a path it cannot see**, same 17 min | **2,620 frames → 0** after our safety fixes (and 930 → 0 on a lost / impossible ground estimate) |
+| **Automated checks** (no GPU, no camera needed) | **185 passing**: geometry, costmap rules, planners, state machine, rover link |
+| **3D simulation** | 130 m A → B course: boulders, fallen tree, ditch, pond, a person walking across; scored against ground truth |
+
+## 🧠 How it thinks
+
+```mermaid
+flowchart LR
+    CAM["📷 One RGB camera"] --> D["Depth<br/>Depth Anything V2"]
+    CAM --> SEM["Semantics<br/>YOLO26 · ADE20K"]
+    D --> GP["Ground plane<br/>RANSAC, every frame<br/>→ height · pitch · roll"]
+    SEM --> GP
+    GP --> CM["Local costmap<br/>semantic ⊕ step ⊕ drop ⊕ hole<br/>UNKNOWN ≠ free"]
+    GP --> VO["Ground-plane VO<br/>metric (x, y, θ)"]
+    CM --> GM["Global costmap<br/>memory · clearing · confirmation"]
+    VO --> GM
+    GM --> GPL["Global planner<br/>A* / D* Lite"]
+    GPL --> LP["Local planner<br/>A* + pure pursuit"]
+    CM --> LP
+    LP --> SAFE{"Safety gates<br/>unknown path · crawl-out ·<br/>lost pose · watchdog"}
+    SAFE --> CMD["(v, ω) → motors"]
+```
+
+**Safety rules that are load-bearing** (each one has a regression test):
+
+- **Unknown is never free.** A path ahead that is ≥ 30% unknown → half speed; ≥ 60% → STOP.
+- **Ditches are obstacles.** A gap in the data with measured ground on both sides is a trench the camera cannot see into.
+- **Geometry vetoes semantics.** A "wall" label on ground measured flat is expensive, not blocked; water is always lethal.
+- **Clearance means out, slowly.** Inside an obstacle's clearance the robot may only move away from it, at ≤ 0.15 m/s.
+- **Impossible geometry is not trusted.** A fitted camera height outside the rig's range makes the map UNKNOWN.
+- **One speck is not a wall.** The global memory needs 3 sightings before a cell blocks the route; the live map still reacts on the first.
+- **Own body masked** (`--ego-mask`): the chassis and wheels in view are ignored, and ground hidden behind them is *occluded*, not a hole.
+
+## 🚦 Status: honest
+
+| ✅ Built and running | 🔜 Next |
+|---|---|
+| Perception, costmap, VO, global + local planning, safety gates | Close the ESC/PWM motor loop on the rover (commands already reach the Pi) |
+| Sim, webcam, real Pi rover, recorded video, all in one server | Onboard compute (Jetson Orin) |
+| Nav2-shaped messages, flight recorder, live dashboard | Stereo depth + ORB-SLAM3 loop closure for long routes |
+| 185 automated checks | ROS 2 Nav2 nodes; public off-road datasets |
+
+> **Footage credit:** the demo GIFs and video are derived from a third-party FPV RC-car video on YouTube ("Ultimate FPV RC Car Adventure: Surprising Range & Control"), used here as a stand-in test track for research and educational demonstration. It is not our rover. Rights remain with the original creator; we will remove it on request. On that footage, scale comes from an assumed 0.10 m camera height (relative depth); pitch and roll are still measured.
+
+---
+
+## 🔧 Technical documentation
 
 > **New here?** Read [EXPLAINED.md](EXPLAINED.md): the whole pipeline, every equation, in plain language.
 
@@ -36,11 +137,12 @@
 | Piece | File | What it does |
 |---|---|---|
 | **Self-calibrating perception** | `perception_core.py` | Metric depth + semantic segmentation → per-frame ground plane (camera **height, pitch, roll are measured, not configured**) → 10 cm cost grid |
-| **Nav2-style planning** | `navstack.py` | Global costmap with memory, coarse global A\*, carrot hand-off, local A\* + pure pursuit, turn-in-place / blocked recovery, watchdog |
+| **Nav2-style planning** | `navstack.py`, `dstar_lite.py` | Global costmap with memory (raw obstacles, free-space clearing), global A\* or incremental **D\* Lite**, carrot hand-off, local A\* + pure pursuit, turn-in-place / blocked recovery, `LOST` stop, watchdog |
+| **Visual odometry** | `ground_vo.py` | Metric odometry from the ground plane: bird's-eye warp through the fitted plane, keyframe registration → `(dx, dy, dθ)`; the rover's pose source |
 | **Server** | `perception_server.py` | One process for every mode: sim frames over WebSocket, webcam, video, or a rover pushing frames over WebSocket. Broadcasts costmaps, plans and commands as JSON |
 | **Dashboard** | `dashboard/index.html` | Camera + semantics, depth, local costmap, global map, plane estimate, goal input |
-| **3D rover sim** | `sim3d/` (from [SLAM3D](https://github.com/Klick07/SLAM3D)) | React Three Fiber + Rapier rover on a 100 m outdoor course; streams its camera (RGB + true depth) and drives on the returned commands |
-| **Rover streamer** | `rover_agent.py` | Runs on the Raspberry Pi: captures from the camera, JPEG-encodes, and pushes frames to `perception_server.py` over WebSocket. Perception, planning and depth all run on the Mac; the Pi does not yet turn `cmd_vel` into motor PWM |
+| **3D rover sim** | `sim3d/` (from [SLAM3D](https://github.com/Klick07/SLAM3D)) | React Three Fiber + Rapier rover on a 130 m outdoor A → B course (boulders, fallen tree, ditch, pond, a walking person, woodland); streams its camera (RGB + true depth), drives on the returned commands, scores itself against ground truth |
+| **Rover streamer** | `rover_agent.py` | Runs on the Raspberry Pi: captures from the camera (ground-metered, slew-limited auto-exposure), JPEG-encodes, and pushes frames to `perception_server.py` over WebSocket. Perception, planning and depth all run on the Mac; the Pi does not yet turn `cmd_vel` into motor PWM |
 | **ROS shapes** | `ros_msgs.py` | `OccupancyGrid`, `Odometry`, `Path`, `Twist` as JSON, ready for rosbridge |
 
 ---
@@ -50,7 +152,7 @@
 ```bash
 # one-time
 ./setup_mac.sh                      # venv + pip install (Apple Silicon: MPS)
-# the rover sim is in ./sim3d ; copy rover.glb road.glb tree.glb into sim3d/public/
+# the rover sim is in ./sim3d ; copy rover.glb tree.glb into sim3d/public/
 # (Sketchfab assets, not in git)
 
 # 3D demo: perception server + rover sim, opens the browser
@@ -76,9 +178,11 @@ python perception_server.py --source rover --depth metric-indoor --depth-res 280
 python3 rover_agent.py --server ws://<mac-ip>:8790/ws --fps 12 --rotation 90
 ```
 
-Then, in the sim: press **T** (or the HUD button) for AUTO, and click a destination on
-the ground, on the course map (bottom-left) or on the global map. The rover plans and
-drives; the HUD shows status, the measured camera pose, collisions, and both maps.
+Then, in the sim: press **▶ Mission A → B** in the HUD (the demo run: goal at pad B,
+AUTO on), or press **T** for AUTO and click any destination on the ground, the course
+map (bottom-left) or the global map. Press **O** mid-run to drop a crate in front of the
+rover. The HUD shows status, the measured camera pose, ground-truth collisions and both
+maps.
 
 Requires macOS with a display for the webcam and the sim; the tests need neither.
 
@@ -100,14 +204,18 @@ frame (RGB [+ true depth from the sim])
       → camera height, pitch, roll   (measured every frame; --height/--pitch are optional LOCKS)
   rotate every point into a GROUND-ALIGNED robot frame (Z = height above ground)
   cost(cell) = max( semantic vote , positive obstacle , negative obstacle , hole )
-  UNKNOWN never free · inflate by the robot radius
+  UNKNOWN never free · returned RAW and INFLATED by the robot radius
   │
+  ├─ ground_vo.py      (rover) bird's-eye warp through the fitted plane, register against a
+  │                    keyframe → (dx, dy, dθ) in metres → VisualOdomPose (sim: true pose)
   ▼  navstack.py
-  GlobalCostmap.fuse   world frame, max-fusion, remembers everything ever seen
-  plan_global          A* on a coarse boxed copy ≤ 1 Hz → world path
+  GlobalCostmap.fuse   world frame, RAW obstacles (inflation is applied at plan time),
+                       max-fusion; optional clearing of cells re-observed free
+  plan_global          A* (or D* Lite, kept and repaired between plans) on a coarse,
+                       inflated, boxed copy ≤ 1 Hz → world path
   carrot               first path point ~10 m ahead → local goal
-  local A* + pure pursuit on the frame grid backfilled from global memory → (v, ω)
-  Navigator            NO_GOAL / PLANNING / TURNING / DRIVING / BLOCKED / ARRIVED
+  local A* + pure pursuit on the frame grid backfilled from memory, then inflated → (v, ω)
+  Navigator            NO_GOAL / PLANNING / TURNING / DRIVING / BLOCKED / LOST / ARRIVED
 ```
 
 ### Why the geometry is self-calibrating
@@ -133,6 +241,16 @@ live accuracy check: the HUD shows the estimate against the mount.
 | Evidence floors | < 3 points → UNKNOWN; geometry needs ≥ 2 agreeing points and ≥ 20 % of the cell | depth speckle |
 | Fusion | `max` of everything; UNKNOWN is expensive for the planner but passable | the safety argument |
 
+### What the navigator will not do (all tested in `test_nav.py`)
+
+| Rule | Why it exists |
+|---|---|
+| The local planner never puts the robot's **centre** inside the inflation skirt (253) — it is a collision, not a squeeze. A robot already inside one may leave it, never go deeper | the old "passable at high cost" skirt is how the sim rover drove into a trench whose edge was marked correctly |
+| A goal inside a hazard's clearance → stop at the closest safe point, `ARRIVED` with a note | a goal clicked beside a ditch otherwise pulls the robot to the lip |
+| No safe step (lethal ahead, a one-cell plan, or a plan ending inside `stop_dist`) → `BLOCKED` → spin recovery, never "DRIVING at 0 m/s" | three paths used to freeze the rover forever while it reported driving |
+| A global map but no pose (odometry lost) → `LOST`, stop | the world-frame goal used to be read as robot-relative, i.e. the wrong way |
+| Memory stores raw obstacles; every noisy detection's skirt is not remembered forever | fusing inflated grids grew a rock's footprint from 39 to 548 cells in 30 frames |
+
 ---
 
 ## 4. The 3D simulation demo
@@ -149,13 +267,37 @@ live accuracy check: the HUD shows the estimate against the mount.
 The server answers with `(v, ω)`; the rover applies each command for one control
 period, then holds heading until the next (this is what removed the zig-zag).
 
-**Course** (`src/nav/world.js`, seedable with `?seed=`): road with boulders, rubble
-clusters, trees, fallen logs, bushes, signposts, two fences, **two trenches**, two
-ponds and a puddle, mud and sand patches, a grassy mound. Every hazard is scored by a
-ground-truth contact counter the perception never sees.
+**Course** (`src/nav/world.js`): a 130 m dirt trail from pad **A** to pad **B** through
+open meadow, one challenge per zone, every detour sized for the robot (the server
+inflates obstacles by a 1 m radius; the tightest zone still leaves 8.75 m of free width,
+checked by rasterising the ground truth):
 
-**Controls**: WASD drive (takes over from AUTO), Space brake, **T** AUTO/MANUAL, **C**
-camera (chase / top / driver), click ground or maps to set the goal, X,Y box in the HUD.
+| d (m) | zone | exercises |
+|---|---|---|
+| 14–32 | boulder field | positive obstacles (height) |
+| 42 | fallen tree across the trail | positive obstacle, detour |
+| 56 | washed-out drainage ditch, 0.6 m deep | negative obstacle (depth only), go round its end |
+| 68–80 | pond beside the trail, puddle on it | water in a real depression: depth **and** semantics |
+| 90 | a person walking across the trail | dynamic obstacle |
+| 100–116 | woodland: trunks and bushes near the trail | clutter |
+| 120 | mud across the trail | drivable but costly (semantics) |
+
+The terrain is a Rapier heightfield (ditch and ponds are real depressions the rover can
+fall into); hills rise beyond ~24 m from the trail, past the 20 m depth horizon. Every
+hazard is scored by a ground-truth contact counter the perception never sees; the goal
+flag and path lines are drawn on a layer the robot camera does not render.
+
+**Controls**: **▶ Mission A → B** (sets the goal at B and switches to AUTO), **Drop
+obstacle / O** (a crate appears 6 m ahead: the "sudden obstacle" test), WASD drive
+(takes over from AUTO), Space brake, **T** AUTO/MANUAL, **C** camera (chase / top /
+driver), click ground or maps to set a goal, X,Y box in the HUD.
+
+**Flight recorder**: the server keeps the last 300 frames of what the local planner saw
+(planning grid after memory backfill, pose, carrot, path, command, AUTO/MANUAL) and writes
+them to `logs/flight_*.pkl.gz` whenever the sim reports a ground-truth contact, or on
+`GET /debug/dump`.
+
+Measured (seed 7, `--depth sim`, A\*): A → B in 85 s, 0 contacts, no intervention.
 
 **Frames**: nav world X = −three.z, Y = −three.x, θ = heading (CCW positive), converted
 in exactly one place (`src/nav/frames.js`). Protocol in [PROTOCOL.md](PROTOCOL.md).
@@ -243,6 +385,24 @@ silently rescale every distance in the costmap). It works, but remounting the ca
 upright is strictly better: software rotation narrows the usable horizontal FOV to
 48.8°.
 
+**Pose: ground-plane visual odometry.** `ground_vo.py` warps the ground through the
+plane fitted this frame into a metric top-down image (5 mm pixels), tracks it against a
+keyframe (new keyframe every 15 cm or 8°) and reads `(dx, dy, dθ)` straight off a rigid
+fit — the scale comes from the camera height the plane already measured, so there is no
+monocular scale ambiguity. Features are kept away from the edge of the camera's view (a
+fixed edge in the warp votes for "no motion") and matches must actually look alike
+(patch NCC), so a featureless floor reports "lost" instead of a confident standstill.
+`navstack.VisualOdomPose` integrates the steps with exact SE(2) composition; after 8
+failed frames the pose is withheld and the Navigator stops with `LOST`. On rendered
+ground (`test_rover.py`): 0.05 cm over 3 m straight, 1.1 cm over a 3 m arc, 0.03 mm
+after 20 s standing still. No figure from a real traverse yet.
+
+**Camera exposure.** `rover_agent.py --ae ground` (default) runs a slow software
+auto-exposure metered on the lower, ground part of the image: at most 15 % per 0.5 s, a
+dead band, and an 8 ms shutter cap (gain makes up the rest — rolling shutter smears on a
+rigid chassis). A one-off lock at start-up (`--ae locked`, the old behaviour) is fine on
+a bench and fails the first time the rover drives into shade.
+
 **Which depth model.** Use `--depth metric` outdoors and `--depth metric-indoor` for
 bench testing — the outdoor-trained model reads a ~2 m indoor wall as 5–9 m away,
 leaving only a small fraction of pixels inside `max_depth`. Both are metric, so
@@ -268,7 +428,8 @@ local costmap + controller, recovery behaviours) and emits Nav2-shaped messages:
 
 These are exactly what a rosbridge publisher would send; swapping in real Nav2 later
 means publishing them and reading `cmd_vel` back. The pose enters through
-`navstack.PoseSource` — today ground truth from the sim, later the team's visual SLAM.
+`navstack.PoseSource` — ground truth in the sim, ground-plane visual odometry on the
+rover, and later the team's visual SLAM.
 
 ---
 
@@ -284,15 +445,27 @@ means publishing them and reading `cmd_vel` back. The pose enters through
 | `--dist` | none | lens distortion `k1,k2,p1,p2,k3` for camera/video rigs, rectified once up front; the rover sends its own per frame |
 | `--height --pitch --roll` | estimate | **lock** the camera pose instead of measuring it |
 | `--nominal-height` | `None` → 0.60 m (camera/video), 0.17 m (`--source rover`) | camera height used to scale `relative`/`affine` depth; the one ruler measurement that gives the map its metric scale |
+| `--ego-mask` | none | PNG, white = the vehicle's own body in frame. Ignored by the plane fit, costmap and VO; ground hidden behind it is occluded, not a hole |
+| `--plausible-height` | nominal/3 – nominal×3 when a nominal height is known (rover, or `--nominal-height` given); never in the sim | `lo,hi` metres. A fitted camera height outside it is not ground (metric depth reads a 10 cm FPV camera as ~2.5 m up), so the map is reported UNKNOWN instead of built on it |
 | `--v-max --w-max --robot-radius` | 2.0 / 0.8 / 1.0 (sim), 0.5 / 1.0 / 0.20 (rover) | controller limits and inflation |
+| `--global-planner` | `auto` → `dstar` (rover), `astar` (else) | global planner; D\* Lite gives the same path cost as A\* and replans ~5x faster when the map changes a little at a time |
 | `--port` | 8790 | dashboard + WebSocket |
 | `--profile` | off | per-stage milliseconds |
+
+`rover_agent.py`: `--server`, `--fps`, `--rotation`, intrinsics `--fx --fy --cx --cy --dist`,
+`--ae ground|locked`.
 
 Live tunables (dashboard or `set_param`): `obstacle_h`, `ditch_h`, `robot_radius`,
 `sem_lethal_frac`, `min_cell_pts`, `plane_gate`, `plane_near_range`, `max_depth`.
 Grid: sim 0.5–12 m × ±5 m (0.1 m cells); webcam 0.3–8 m × ±4 m (0.1 m cells);
 rover 0.20–2.60 m × ±1.30 m (0.05 m cells — a 0.25 m chassis needs a finer grid than
 the sim or a webcam get away with).
+
+**Unknown-path gate (camera, video, rover; off in the sim).** UNKNOWN stays passable for
+the planner, so a frame whose map came out empty used to produce a full-speed plan
+straight through it. Now the first 1.5 m of the chosen path is checked: ≥ 30 % UNKNOWN →
+half speed (`note: slow: path ahead N% unknown`), ≥ 60 % → `BLOCKED`
+(`NavCfg.unknown_gate*`).
 
 ---
 
@@ -302,9 +475,11 @@ No models, no camera, no GPU; a few seconds each.
 
 ```bash
 source .venv/bin/activate
-python test_perception_core.py   # 63 checks: plane recovery, roll, step-down, trench, tall labels, hold, locks…
-python test_nav.py               # 42 checks: fusion, global A*, carrot, memory, state machine, ROS shapes
-python test_geometry.py          # legacy prototype, still green
+python test_perception_core.py   # 59 checks: plane recovery, roll, step-down, trench, tall labels, hold, locks…
+python test_nav.py               # 68 checks: fusion, clearing, global A* and D* Lite, carrot, memory, state machine
+                                 #   (LOST, no silent standstill, goal beside a trench), ROS shapes
+python test_rover.py             # 16 checks: ground VO drift on rendered ground, failure reporting, Pi auto-exposure
+python test_geometry.py          # 42 checks: legacy prototype, still green
 python sim.py --validate         # legacy analytic simulator
 ```
 
@@ -332,18 +507,22 @@ the constraint, not the camera. Over a 2.4 GHz phone hotspot: 24.2 Mbit/s, RTT 1
 
 ```
 perception_core.py      self-calibrating geometry + costmap + model wrappers
-navstack.py             global costmap, global planner, carrot, Navigator
+navstack.py             global costmap, global planners, carrot, Navigator, pose sources
+dstar_lite.py           D* Lite: incremental global planning on the same grid and costs as A*
+ground_vo.py            ground-plane visual odometry (the rover's pose)
 ros_msgs.py             Nav2-shaped message dicts
 perception_server.py    aiohttp server: sources, worker, WebSocket, dashboard, /ros
 rover_agent.py          runs on the Pi: capture, JPEG-encode, stream frames to the server
 dashboard/index.html    browser dashboard (any source)
 PROTOCOL.md             wire protocol between sim, server and viewers
 synth_scene.py          analytic scenes for tests and for driving the server without a browser
-test_perception_core.py / test_nav.py     test suites
+test_perception_core.py / test_nav.py / test_rover.py     test suites
+logs/                   flight records (planner frames around each ground-truth contact)
 run_sim.sh / run_webcam.sh / stop_all.sh  one-command launchers and shutdown
 costmap_prototype.py, sim.py, test_geometry.py, calibrate.py   legacy prototype (see §13)
-sim3d/src/nav/*         config, frames, WebSocket link, capture, course + ground truth
-sim3d/src/components/*  Environment, Vehicle, RobotCamera, GoalMarker, Hud, MiniMap
+sim3d/src/nav/*         config, frames, WebSocket link, capture, course + terrain + ground truth
+sim3d/src/components/*  Environment (sky, heightfield terrain, trail, hazards, walker), Vehicle,
+                        RobotCamera, GoalMarker, Hud, MiniMap
 ```
 
 Models download to the HuggingFace cache on first run: `Depth-Anything-V2-Metric-Outdoor-Small-hf`
@@ -354,11 +533,15 @@ looked for in `../object segmentation/` or next to the server (`--sem-weights`).
 
 ## 12. Known limitations
 
-- **Single camera, no odometry in webcam or rover mode**: `has_pose` is only true for
-  the sim, so neither mode has a global map or temporal fusion — every frame plans
-  fresh, goals are robot-relative (a carrot in front of the camera, or a click on the
-  local costmap). The rover has no pose source yet and no SLAM bridge built; that
-  landing is what `GlobalCostmap` and `has_pose` are already shaped to accept.
+- **Rover localisation is visual odometry only**: `ground_vo.py` registers bird's-eye
+  views of the ground against a keyframe (metric, no scale ambiguity) and `navstack`
+  stops with `LOST` whenever it drops out. On rendered ground it drifts < 0.1 % over
+  3 m; on real ground expect far worse (blur, shadows, relief) - there is no loop
+  closure and no drift figure from a real traverse yet. The webcam has no pose source
+  (robot-relative goals, no global map).
+- **Single-plane ground model**: the plane fit assumes locally flat ground; a slope in
+  the near field (the old course's grassy mound) is fitted instead of the ground and
+  reads as a wall. The demo course keeps the route flat and puts hills out of range.
 - **The `affine` depth path is not usable standalone.** Depth Anything's relative
   disparity is affine-invariant, `1/Z = a·disp + b`, and `DepthModel`'s plain `1/disp`
   assumes `b = 0`. Solving both `a` and `b` from ground planarity alone — which an
@@ -384,7 +567,9 @@ looked for in `../object segmentation/` or next to the server (`--sem-weights`).
   limits it to ~2.6 m (honest: none of them can see further at that geometry).
 - **Semantics on synthetic imagery** is approximate; the tall-label check protects
   drivable ground from mislabels, water/mud/sand grading depends on the segmenter.
-- **Pure Python planners**: the global A\* is boxed and pooled to stay under ~100 ms.
+- **Pure Python planners**: the global A\* is boxed and pooled to stay under ~100 ms;
+  `--global-planner dstar` (D\* Lite, default on the rover) keeps the search between
+  replans and repairs only what changed (same path cost, ~5x faster per replan).
 
 ---
 

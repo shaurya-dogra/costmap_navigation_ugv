@@ -11,6 +11,8 @@ One process serves every demo mode:
                         socket: RGB JPEG + intrinsics + lens distortion, no depth.
   --source 0            MacBook / phone webcam captured here, dashboard only.
   --source clip.mp4     recorded footage, looped.
+  --source http://cam:81/stream   network camera (MJPEG stream, or a still-JPEG URL
+                        polled; an ESP32 /stream that stays silent falls back to /capture).
 
 Behaviour is driven by CAPABILITY FLAGS set once in __init__ (pushes_frames,
 has_true_depth, has_pose, is_vehicle), never by the source name - so adding a source
@@ -40,6 +42,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import argparse
 import asyncio
+import collections
 import base64
 import json
 import math
@@ -166,8 +169,85 @@ class FrameSlot:
             return item
 
 
+class HttpCamera:
+    """Network camera reader with a cv2.VideoCapture-like read().
+
+    MJPEG over HTTP is parsed here rather than by FFmpeg: FFmpeg blocks for 30 s on
+    a stream that connects but never sends (an ESP32 httpd serves one /stream client
+    at a time), and it buffers, which adds lag. JPEGs are cut out of the byte stream
+    by their SOI/EOI markers, so the multipart boundary format does not matter.
+    If the stream yields no frame within `stall` seconds, a still URL (/capture on
+    port 80 for an ESP32 :81/stream URL, or the URL itself if it returns one JPEG)
+    is polled instead - slower, but it works while another viewer holds the stream.
+    """
+
+    def __init__(self, url: str, stall: float = 4.0):
+        import urllib.parse
+        self.url, self.stall = url, stall
+        u = urllib.parse.urlsplit(url)
+        self.still_url = (urllib.parse.urlunsplit((u.scheme, u.hostname, "/capture", "", ""))
+                          if u.path.rstrip("/").endswith("stream") else url)
+        self.resp = None
+        self.buf = b""
+        self.polling = False
+
+    def isOpened(self):
+        return True
+
+    def _open_stream(self):
+        import urllib.request
+        try:
+            self.resp = urllib.request.urlopen(self.url, timeout=self.stall)
+            ctype = self.resp.headers.get("Content-Type", "")
+            if "multipart" not in ctype:            # a still-JPEG URL: poll it
+                self.resp.close()
+                self.resp, self.polling, self.still_url = None, True, self.url
+                print(f"[capture] {self.url} is not a stream ({ctype}); polling it", file=sys.stderr)
+        except Exception as e:
+            self.resp = None
+            self.polling = True
+            print(f"[capture] stream {self.url} gave nothing ({e}); polling {self.still_url}", file=sys.stderr)
+
+    def read(self):
+        import urllib.request
+        if self.resp is None and not self.polling:
+            self._open_stream()
+        try:
+            if self.polling:
+                data = urllib.request.urlopen(self.still_url, timeout=3).read()
+                frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                return frame is not None, frame
+            while True:
+                chunk = self.resp.read1(65536) if hasattr(self.resp, "read1") else self.resp.read(4096)
+                if not chunk:
+                    raise ConnectionError("stream closed")
+                self.buf += chunk
+                end = self.buf.rfind(b"\xff\xd9")
+                start = self.buf.rfind(b"\xff\xd8", 0, end) if end >= 0 else -1
+                if start >= 0:
+                    jpg, self.buf = self.buf[start:end + 2], self.buf[end + 2:]
+                    frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                    return frame is not None, frame
+                if len(self.buf) > 4 << 20:
+                    self.buf = self.buf[-(1 << 20):]
+        except Exception as e:
+            print(f"[capture] {e}; reconnecting", file=sys.stderr)
+            if self.resp is not None:
+                self.resp.close()
+            self.resp, self.buf = None, b""
+            time.sleep(0.5)
+            return False, None
+
+    def set(self, *_):
+        return False
+
+    def release(self):
+        if self.resp is not None:
+            self.resp.close()
+
+
 class CaptureSource(threading.Thread):
-    """cv2.VideoCapture reader: webcam (zero-lag, latest frame) or looped video file."""
+    """cv2.VideoCapture reader: webcam (zero-lag, latest frame), network camera or looped video file."""
 
     def __init__(self, src, slot: FrameSlot, size=(1280, 720), every=1, fps_cap=None):
         super().__init__(daemon=True)
@@ -178,7 +258,9 @@ class CaptureSource(threading.Thread):
         self.seq = 0
 
     def run(self):
-        if isinstance(self.src, int) and sys.platform == "darwin":
+        if isinstance(self.src, str) and self.src.startswith(("http://", "https://")):
+            cap = HttpCamera(self.src)
+        elif isinstance(self.src, int) and sys.platform == "darwin":
             cap = cv2.VideoCapture(self.src, cv2.CAP_AVFOUNDATION)
             if not cap.isOpened():
                 cap = cv2.VideoCapture(self.src)
@@ -256,6 +338,7 @@ class PerceptionServer:
         self.windows = a.windows
         self._win_frames: dict = {}
         self.vo: Optional[gvo.GroundVO] = None   # rover only; None elsewhere
+        self.recorder: collections.deque = collections.deque(maxlen=300)
         self._streams: dict = {}          # name -> latest full-size JPEG bytes
         self._stream_seq = -1             # bumped per processed frame, so viewers can wait
 
@@ -266,7 +349,11 @@ class PerceptionServer:
                                   stride=2, ditch_max_range=9.0, hole_max_range=9.0)
             self.ncfg = ns.NavCfg(v_max=a.v_max or 2.0, w_max=a.w_max or 0.8, goal_tol=1.2, slow_dist=4.0,
                                   lookahead=2.5, stop_dist=1.2, turn_gain=1.0, turn_enter_deg=70.0)
-            self.gmap = ns.GlobalCostmap(res=0.25, size_m=160.0)
+            # clear_after: the demo course has a person walking across the trail and
+            # obstacles dropped at run time; with pure max-fusion each would leave a
+            # permanent lethal smear. The pose is exact here, so clearing ground the
+            # camera re-observes as free for 4 frames (~0.7 s) is safe.
+            self.gmap = ns.GlobalCostmap(res=0.25, size_m=320.0, clear_after=4)
             self.pose_src = ns.GroundTruthPose()
         elif self.source_kind == "rover":
             # Measured rig: IMX219 at 640x480 from the FULL-FOV 1640x1232 sensor mode.
@@ -284,14 +371,23 @@ class PerceptionServer:
             # Ground-plane visual odometry supplies the pose, so the global map works.
             # 0.05 m to match the local grid, 16 m across - a rover with a 2.6 m horizon
             # is not going to outrun that, and it keeps fuse() cheap.
-            self.gmap = ns.GlobalCostmap(res=0.05, size_m=16.0)
+            # lethal_confirm: a cell must be seen lethal 3 times before the MEMORY blocks it
+            # (the live local map still blocks on the first sighting) - monocular specks,
+            # inflated and pooled at plan time, otherwise wall off a narrow trail.
+            # clear_after: odometry drifts and people walk through, so a cell the camera
+            # re-observes as free for ~0.5 s (6 frames at 12 Hz) is cleared. The sim keeps
+            # the default 0 (remember forever): its pose is exact and its course static.
+            self.gmap = ns.GlobalCostmap(res=0.05, size_m=16.0, clear_after=6, lethal_confirm=3)
             self.pose_src = ns.VisualOdomPose()
             self.vo = gvo.GroundVO()
             if a.map_view == 60.0:      # the sim-scaled default dwarfs a 16 m map
                 a.map_view = 8.0
         else:
-            W, H = a.proc_width, int(round(a.proc_width * 9 / 16))
             preset = pc.RIG_PRESETS.get(a.rig, {})
+            # keep the camera's aspect: resizing 4:3 into 16:9 squashes rows, which
+            # breaks the square-pixel intrinsics and tilts the fitted ground plane
+            aspect = a.aspect or preset.get("aspect") or 16 / 9
+            W, H = a.proc_width, int(round(a.proc_width / aspect))
             hfov = a.hfov or preset.get("hfov") or 78.0
             fx, fy, cx, cy = pc.intrinsics_from_hfov(W, H, hfov)
             self.cfg = pc.CoreCfg(w=W, h=H, fx=fx, fy=fy, cx=cx, cy=cy, x_min=0.3, x_max=8.0,
@@ -309,9 +405,27 @@ class PerceptionServer:
             self.cfg.nominal_height = a.nominal_height
         if a.dist:                       # camera/video rigs; the rover sends its own per frame
             self.cfg.dist = tuple(float(v) for v in a.dist.split(","))
+        if self.source_kind != "sim":
+            # Real cameras get the safety gates the sim's true depth never needed (and
+            # whose tuned runs they must not change): stop on a mostly-unknown path, and
+            # refuse a ground plane at a height this rig cannot have - 3x either side of
+            # the nominal mount, when a nominal is known (rover default, or given).
+            self.ncfg.unknown_gate = True
+            self.ncfg.escape_v = 0.15       # crawl out of an obstacle's clearance, never cruise
+            if a.plausible_height:
+                self.cfg.plane_plausible = tuple(float(v) for v in a.plausible_height.split(","))
+            elif self.source_kind == "rover" or a.nominal_height is not None:
+                h0 = self.cfg.nominal_height
+                self.cfg.plane_plausible = (h0 / 3.0, h0 * 3.0)
         self.core = pc.PerceptionCore(self.cfg)
+        # Global planner: D* Lite on the rover (its map changes cell by cell as the camera
+        # reveals ground, which is what incremental replanning is for); A* stays the sim's
+        # default so the tuned demo is unchanged unless asked (--global-planner dstar).
+        algo = a.global_planner if a.global_planner != "auto" else (
+            "dstar" if self.source_kind == "rover" else "astar")
+        self.pcfg_algo = algo
         self.nav = ns.Navigator(self.cfg, self.ncfg, self.gmap,
-                                ns.PlannerCfg(robot_radius=self.cfg.robot_radius))
+                                ns.PlannerCfg(robot_radius=self.cfg.robot_radius, algo=algo))
         if a.goal:
             gx, gy = (float(v) for v in a.goal.split(","))
             self.nav.set_goal(gx, gy)
@@ -322,7 +436,8 @@ class PerceptionServer:
 
         # ---- models -----------------------------------------------------------
         self.device = pc.pick_device()
-        print(f"[server] device {self.device}, source {self.source_kind}, depth {self.depth_mode}")
+        print(f"[server] device {self.device}, source {self.source_kind}, depth {self.depth_mode}, "
+              f"global planner {self.pcfg_algo}")
         self.depth_models: dict = {}
         if self.depth_mode != "sim" or not self.has_true_depth:
             self._depth_model("metric" if self.depth_mode == "sim" else self.depth_mode)
@@ -334,6 +449,18 @@ class PerceptionServer:
             raise SystemExit("no YOLO26 ADE20K semantic weights found; pass --sem-weights")
         print(f"[server] semantics: {weights.name}")
         self.sem = pc.SemanticModel(str(weights), self.device, imgsz=a.sem_imgsz)
+        # Ego mask: pixels of the vehicle's own body (bonnet, wheels) that a low camera
+        # sees in every frame. Without it the chassis is back-projected as ground right in
+        # front of the robot and reads as a rough patch it can never drive off. Masked
+        # pixels take semantic cost -1, the "ignore" value sky already uses, so the plane
+        # fit, the costmap and VO all skip them with no new logic.
+        self.ego_mask = None
+        if a.ego_mask:
+            m = cv2.imread(a.ego_mask, cv2.IMREAD_GRAYSCALE)
+            if m is None:
+                raise SystemExit(f"cannot read --ego-mask {a.ego_mask}")
+            self.ego_mask = m > 127
+            print(f"[server] ego mask: {self.ego_mask.mean():.0%} of the frame ignored")
 
         self.worker = threading.Thread(target=self._work, daemon=True)
 
@@ -442,6 +569,12 @@ class PerceptionServer:
         # ---- semantics --------------------------------------------------------------
         labels = self.sem(bgr)
         sem_cost = self.sem.cost(labels)
+        if self.ego_mask is not None:
+            if self.ego_mask.shape != sem_cost.shape:
+                self.ego_mask = cv2.resize(self.ego_mask.astype(np.uint8), sem_cost.shape[::-1],
+                                           interpolation=cv2.INTER_NEAREST) > 0
+            sem_cost = np.where(self.ego_mask, -1, sem_cost).astype(sem_cost.dtype)
+            self.cfg.ego_mask = self.ego_mask
         prof.lap("sem")
 
         # ---- costmap (self-calibrating) ---------------------------------------------
@@ -473,8 +606,17 @@ class PerceptionServer:
         prof.lap("vo")
 
         # ---- navigation -------------------------------------------------------------
-        out = self.nav.step(grid, pose)
+        out = self.nav.step(grid, pose, raw=res.raw)
         v, w = out.v, out.omega
+        # flight recorder: the last few hundred frames of what the planner decided and
+        # why, dumped to logs/ when the sim reports a ground-truth contact (or on demand)
+        self.recorder.append(dict(
+            t=time.time(), seq=seq, status=out.status, note=out.note, v=v, w=w,
+            mode="auto" if self.mode_auto else "manual",
+            pose=None if pose is None else (pose.x, pose.y, pose.theta), goal=self.nav.goal,
+            local_goal=out.local_goal, local_path=list(out.local_path), global_path=list(out.global_path[:40]),
+            plan_grid=getattr(self.nav, "last_plan_grid", grid), live_grid=grid,
+            plane=(res.plane.height, res.plane.pitch, res.plane.roll, res.plane.confidence)))
         if not self.mode_auto and self.source_kind == "sim":
             v, w = 0.0, 0.0             # manual: the human drives; still report the plan
         prof.lap("nav")
@@ -546,6 +688,22 @@ class PerceptionServer:
                                grid=dict(x_min=cfg.x_min, x_max=cfg.x_max, y_min=cfg.y_min, y_max=cfg.y_max, res=cfg.res)),
                     **{"global": glob}, images=images, profile=prof.d, warnings=warnings, note=out.note,
                     dropped=self.slot.dropped)
+
+    def dump_recorder(self, reason: str = "manual", extra: Optional[dict] = None) -> str:
+        """Write the recorder ring buffer to logs/flight_<time>.pkl.gz and return the path."""
+        import gzip, pickle
+        out_dir = HERE / "logs"
+        out_dir.mkdir(exist_ok=True)
+        path = out_dir / f"flight_{time.strftime('%Y%m%d_%H%M%S')}.pkl.gz"
+        cfg = self.cfg
+        with gzip.open(path, "wb") as f:
+            pickle.dump(dict(reason=reason, extra=extra or {}, frames=list(self.recorder),
+                             grid=dict(x_min=cfg.x_min, x_max=cfg.x_max, y_min=cfg.y_min, y_max=cfg.y_max,
+                                       res=cfg.res, robot_radius=cfg.robot_radius)), f)
+        return str(path)
+
+    async def debug_dump(self, request):
+        return web.json_response(dict(path=self.dump_recorder("on demand"), frames=len(self.recorder)))
 
     def _reset(self):
         self.nav.reset()
@@ -628,6 +786,13 @@ class PerceptionServer:
         elif t == "set_goal":
             self.nav.set_goal(float(cmd["x"]), float(cmd["y"]))
             await self._send_all(dict(type="goal", goal=self._goal_dict()))
+        elif t == "event":
+            # the sim's ground-truth contact counter (which perception never sees) hit
+            # something: keep the frames that led up to it
+            if time.time() - getattr(self, "_last_dump_t", 0.0) > 5.0:    # one record per incident
+                self._last_dump_t = time.time()
+                path = self.dump_recorder(reason=f"{cmd.get('kind', 'event')} {cmd.get('hazard', '')} {cmd.get('id', '')}", extra=cmd)
+                print(f"[server] {cmd.get('kind')} {cmd.get('hazard')} {cmd.get('id')} -> flight record {path}")
         elif t == "clear_goal":
             self.nav.clear_goal()
             await self._send_all(dict(type="goal", goal=None))
@@ -748,6 +913,7 @@ class PerceptionServer:
         app.router.add_get("/", self.index)
         app.router.add_get("/ws", self.ws_handler)
         app.router.add_get("/status", self.status)
+        app.router.add_get("/debug/dump", self.debug_dump)
         app.router.add_get("/streams", self.streams_index)
         app.router.add_get("/{what:costmap|camera|overlay|depth}", self.mjpeg)
         app.router.add_get("/ros/{what}", self.ros)
@@ -770,6 +936,12 @@ class PerceptionServer:
 
 # ----------------------------------------------------------------------------
 
+def parse_aspect(v: str) -> float:
+    """'4:3' or '1.333' -> width / height."""
+    w, _, h = v.partition(":")
+    return float(w) / float(h) if h else float(w)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", default="0", help="'sim' (SLAM3D pushes frames), 'rover' (the Pi pushes frames), camera index, or video path")
@@ -777,6 +949,8 @@ def main():
                     help="metric: Depth Anything V2 metric-outdoor (default); relative: 1/disp + nominal-height scale; "
                          "affine: solve BOTH affine unknowns from ground planarity (best on a fixed low rig); sim: renderer depth")
     ap.add_argument("--rig", default="macbook", choices=list(pc.RIG_PRESETS), help="intrinsics preset for camera/video sources")
+    ap.add_argument("--ego-mask", dest="ego_mask", default=None,
+                    help="PNG, white = the vehicle's own body in frame (ignored by plane fit, costmap and VO)")
     ap.add_argument("--dist", default=None, help="lens distortion 'k1,k2,p1,p2,k3' (camera/video sources; the rover sends its own)")
     ap.add_argument("--hfov", type=float, default=None, help="horizontal field of view in degrees (overrides --rig)")
     ap.add_argument("--height", type=float, default=None, help="LOCK camera height (m) instead of estimating it")
@@ -786,14 +960,21 @@ def main():
                     help="camera height (m) used to scale RELATIVE/AFFINE depth. Default 0.60 for a camera "
                          "rig, 0.17 for --source rover. This one ruler measurement is what gives the whole "
                          "map its metric scale.")
+    ap.add_argument("--plausible-height", dest="plausible_height", default=None,
+                    help="'lo,hi' metres: a fitted camera height outside this makes the map UNKNOWN "
+                         "(default: nominal/3..nominal*3 when a nominal height is known; never in the sim)")
     ap.add_argument("--goal", default=None, help="initial goal 'x,y' (world if sim, robot frame otherwise)")
     ap.add_argument("--auto", action="store_true", help="start the sim in AUTO mode")
     ap.add_argument("--v-max", dest="v_max", type=float, default=None)
     ap.add_argument("--w-max", dest="w_max", type=float, default=None)
     ap.add_argument("--robot-radius", dest="robot_radius", type=float, default=None)
+    ap.add_argument("--global-planner", dest="global_planner", default="auto", choices=["auto", "astar", "dstar"],
+                    help="global planner: 'auto' = D* Lite for the rover, A* otherwise")
     ap.add_argument("--map-view", dest="map_view", type=float, default=60.0, help="global map crop shown, metres")
     ap.add_argument("--depth-res", dest="depth_res", type=int, default=336, help="depth model input (multiple of 14; 252/280 faster)")
-    ap.add_argument("--proc-width", dest="proc_width", type=int, default=640, help="processing width for camera/video sources (16:9)")
+    ap.add_argument("--proc-width", dest="proc_width", type=int, default=640, help="processing width for camera/video sources")
+    ap.add_argument("--aspect", type=parse_aspect,
+                    default=None, help="processing aspect for camera/video sources, e.g. 4:3 (default: the rig's, else 16:9)")
     ap.add_argument("--depth-smooth", dest="depth_smooth", type=float, default=0.0, help="EMA on the depth map (0 = off)")
     ap.add_argument("--sem-weights", dest="sem_weights", default=None)
     ap.add_argument("--sem-imgsz", dest="sem_imgsz", type=int, default=640)

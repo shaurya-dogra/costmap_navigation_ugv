@@ -15,7 +15,7 @@ Run:  python costmap_prototype.py --source 0
 import os
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-import argparse, heapq, time
+import argparse, heapq, math, time
 from math import hypot as _hypot
 import numpy as np
 import cv2
@@ -655,12 +655,21 @@ def traversal_cost(grid, cfg):
     Expensive-but-passable means it will cross unmapped ground only when no
     measured route exists, which is the behaviour we actually want.
 
-    Only true LETHAL (254) cells block. The 253 inflation skirt stays passable
-    at very high cost, so a tight gap is squeezed through rather than the plan
-    failing outright.
+    Only true LETHAL (254) cells block by default. The 253 inflation skirt stays
+    passable at very high cost, so a tight gap is squeezed through rather than
+    the plan failing outright.
+
+    `cfg.inscribed_blocks = True` (the Navigator's LOCAL planner) makes 253 block
+    too, which is what 253 means: the robot's CENTRE within one radius of an
+    obstacle, i.e. its body already over the rock or the trench lip. Squeezing
+    through there is exactly how the sim rover drove into a trench whose edge
+    the costmap had marked correctly. `astar` lets a robot that is already inside
+    the skirt leave it (see there).
     """
     cost = grid.astype(np.float32)
     blocked = (grid >= cfg.LETHAL) & (grid != cfg.UNKNOWN)
+    if getattr(cfg, "inscribed_blocks", False):
+        blocked |= grid == cfg.LETHAL - 1
     cost[grid == cfg.UNKNOWN] = cfg.plan_unknown_cost
     return cost, blocked
 
@@ -711,6 +720,21 @@ def astar(grid, cfg, start=None, goal=None):
         return [], False
 
     cost, blocked = traversal_cost(grid, cfg)
+    if getattr(cfg, "inscribed_blocks", False) and grid[sx, sy] == cfg.LETHAL - 1:
+        # Already inside an inflation skirt (a phantom appeared next to us, or we were
+        # pushed there): skirt cells within one robot radius of the start stay passable
+        # so the robot can back out of it. Never LETHAL, and never further in than that,
+        # so the escape cannot become a route along the lip.
+        # "Out" is the operative word: only skirt cells at least as far from the nearest
+        # LETHAL cell as the start are opened. Opening every skirt cell nearby let the
+        # plan run straight INTO the hazard - on FPV footage the rover drove forward at
+        # 0.3 m/s through a fully lethal corridor, ending 0.1 m from an obstacle.
+        r = int(math.ceil(getattr(cfg, "robot_radius", 0.0) / cfg.res)) + 1
+        ii, jj = np.ogrid[:nx, :ny]
+        near = (ii - sx) ** 2 + (jj - sy) ** 2 <= r * r
+        clearance = cv2.distanceTransform((grid != cfg.LETHAL).astype(np.uint8), cv2.DIST_L2, 5)
+        outward = clearance >= clearance[sx, sy] - 1e-3
+        blocked = blocked & ~(near & outward & (grid == cfg.LETHAL - 1))
 
     # Something LETHAL is 0.5 m dead ahead. There is no safe first step, so
     # emit no path at all and let drive_command() bring the robot to a stop.

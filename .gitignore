@@ -27,7 +27,18 @@ sim3d/dist/
 
 # scratch
 scratch/
+logs/
 *.log
 
 # generated knowledge graph (graphify), regenerate with /graphify
 graphify-out/
+
+# README media: the one video that is committed on purpose
+!docs/media/*.mp4
+
+# local only: third-party test footage, internal notes, editor state
+Test video/
+.claude/
+COMPETITIVE_REVIEW.md
+SIH_PPT.md
+SIH_PPT_REVIEW.md

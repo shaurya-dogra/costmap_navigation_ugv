@@ -36,7 +36,7 @@ fi
 if [[ ! -d "$SLAM3D_DIR/node_modules" ]]; then
   echo "installing SLAM3D dependencies..."; (cd "$SLAM3D_DIR" && npm install)
 fi
-for f in rover.glb road.glb tree.glb; do
+for f in rover.glb tree.glb; do
   if [[ ! -f "$SLAM3D_DIR/public/$f" ]]; then
     if [[ -f "$f" ]]; then cp "$f" "$SLAM3D_DIR/public/"; else echo "missing $SLAM3D_DIR/public/$f"; exit 1; fi
   fi

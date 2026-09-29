@@ -1,8 +1,17 @@
-import { useMemo } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
 import { Line } from "@react-three/drei";
 import * as THREE from "three";
 import { useNav } from "../nav/link";
 import { toThree, robotToNavWorld } from "../nav/frames";
+
+/** Everything under this group goes on layer 1: the operator's view shows it, the ROBOT's
+ *  camera (layer 0 only) never does - a goal pole it could see would be an obstacle AT the
+ *  goal, and path lines on the ground would be painted "terrain" for the segmenter. */
+function OperatorOnly({ children, position }) {
+  const ref = useRef();
+  useLayoutEffect(() => { ref.current?.traverse((o) => o.layers.set(1)); });
+  return <group ref={ref} position={position}>{children}</group>;
+}
 
 /** Flag + ring at the server's goal; green once ARRIVED. */
 export function GoalMarker() {
@@ -12,7 +21,7 @@ export function GoalMarker() {
   const arrived = nav && nav.status === "ARRIVED";
   const col = arrived ? "#22c55e" : "#f59e0b";
   return (
-    <group position={[p.x, 0, p.z]}>
+    <OperatorOnly position={[p.x, 0, p.z]}>
       <mesh position={[0, 1.6, 0]} castShadow>
         <cylinderGeometry args={[0.05, 0.05, 3.2, 12]} />
         <meshStandardMaterial color="#eeeeee" />
@@ -25,7 +34,7 @@ export function GoalMarker() {
         <ringGeometry args={[0.9, 1.25, 48]} />
         <meshBasicMaterial color={col} transparent opacity={0.85} />
       </mesh>
-    </group>
+    </OperatorOnly>
   );
 }
 
@@ -38,9 +47,9 @@ export function PathLines() {
   const localPts = useMemo(() => (lp && lp.length >= 2 && pose)
     ? lp.map(([rx, ry]) => { const w = robotToNavWorld(rx, ry, pose); const t = toThree(w.x, w.y); return [t.x, 0.16, t.z]; }) : null, [lp, pose]);
   return (
-    <>
+    <OperatorOnly>
       {globalPts && <Line points={globalPts} color="#facc15" lineWidth={2} transparent opacity={0.9} />}
       {localPts && <Line points={localPts} color="#38bdf8" lineWidth={4} />}
-    </>
+    </OperatorOnly>
   );
 }

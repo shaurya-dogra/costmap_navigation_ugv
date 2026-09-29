@@ -123,6 +123,7 @@ processed replaces it. Send at most one frame per received `nav` (or at ≤ 8 Hz
 {"type": "clear_goal"}
 {"type": "set_mode", "auto": true}             // relayed to the sim inside `nav`
 {"type": "reset"}                              // global map + goal + plane state
+{"type": "event", "kind": "contact", "id": "ditch", "hazard": "ditch"}  // sim ground truth: dump the flight recorder
 {"type": "set_depth", "mode": "metric" | "metric-indoor" | "relative" | "affine" | "sim"}
 {"type": "set_param", "name": "obstacle_h", "value": 0.3}   // tunables, see server --help
 ```
@@ -131,7 +132,7 @@ processed replaces it. Send at most one frame per received `nav` (or at ≤ 8 Hz
 
 ```json
 {"type": "nav", "seq": 1234, "t": 1725500000456.7, "source": "sim", "has_pose": true,
- "status": "NO_GOAL" | "PLANNING" | "TURNING" | "DRIVING" | "BLOCKED" | "ARRIVED" | "STOPPED",
+ "status": "NO_GOAL" | "PLANNING" | "TURNING" | "DRIVING" | "BLOCKED" | "LOST" | "ARRIVED" | "STOPPED",
  "mode": "auto" | "manual",
  "cmd": {"v": 1.2, "omega": -0.15},
  "twist": {"linear": {"x": 1.2, "y": 0, "z": 0}, "angular": {"x": 0, "y": 0, "z": -0.15}},

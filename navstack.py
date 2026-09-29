@@ -15,12 +15,13 @@ shapes it emits are in `ros_msgs.py`.
     GlobalCostmap.fuse()      world frame, max-fusion, UNKNOWN never overwritten
         |
     plan_global()             A* on a coarse, boxed copy      -> world path
+    (or DStarGlobalPlanner)   D* Lite: same grid/costs, search kept and repaired
         |
     carrot()                  first path point ~x_max ahead   -> local goal
         |
     local A* + pure pursuit   (costmap_prototype.astar / drive_command)
         |
-    Navigator                 NO_GOAL / PLANNING / TURNING / DRIVING / BLOCKED / ARRIVED
+    Navigator                 NO_GOAL / PLANNING / TURNING / DRIVING / BLOCKED / LOST / ARRIVED
 
 Pose
 ----
@@ -43,7 +44,10 @@ import cv2
 import numpy as np
 
 from costmap_prototype import astar, drive_command, path_metres   # planner primitives
-from perception_core import CoreCfg, LETHAL, UNKNOWN
+from perception_core import CoreCfg, LETHAL, UNKNOWN, inflate
+
+#: global memory value for a cell seen lethal fewer than `lethal_confirm` times
+UNCONFIRMED = 200
 
 
 # ----------------------------------------------------------------------------
@@ -126,10 +130,12 @@ class VisualOdomPose(PoseSource):
         self.confidence = 0.0
 
     def integrate(self, dx: float, dy: float, dtheta: float, confidence: float = 1.0) -> Pose:
-        """Apply one robot-frame step. Translation happens in the heading held BEFORE the
-        turn, with a half-turn correction - a straight Euler step visibly curves short
-        arcs inward when a frame contains both translation and rotation."""
-        th = self.pose.theta + 0.5 * dtheta
+        """Apply one robot-frame step: exact SE(2) composition. `(dx, dy)` is where the
+        robot now is IN THE FRAME IT HAD BEFORE THE STEP (that is what `GroundVO` measures
+        - the chord of the arc, not a velocity), so it is rotated by the PREVIOUS heading
+        alone. A half-turn "midpoint" correction here would count the turn twice: the
+        chord's own direction already carries it."""
+        th = self.pose.theta
         c, s = math.cos(th), math.sin(th)
         self.pose.x += dx * c - dy * s
         self.pose.y += dx * s + dy * c
@@ -174,16 +180,40 @@ class GlobalCostmap:
     already inflated; nothing inflates it again here.
     """
 
-    def __init__(self, res: float = 0.25, size_m: float = 120.0, decay: float = 0.0):
+    def __init__(self, res: float = 0.25, size_m: float = 120.0, decay: float = 0.0,
+                 clear_after: int = 0, lethal_confirm: int = 1):
         self.res = float(res)
         self.n = int(round(size_m / res))
         self.origin = -size_m / 2.0                 # world coordinate of cell (0, 0)
         self.grid = np.full((self.n, self.n), UNKNOWN, np.uint8)
         self.decay = decay                          # 0 = remember forever
+        # Free-space clearing. 0 = off: pure max-fusion, an obstacle once seen stays
+        # forever (the sim: a static course and a perfect pose). N > 0: a cell re-observed
+        # as NOT an obstacle on N consecutive fusions takes the observed value, so an
+        # obstacle that moved away, or a ghost smeared in by odometry drift, is forgotten
+        # once the camera looks at that ground again. Asymmetric on purpose - one lethal
+        # observation still marks a cell instantly, clearing needs sustained evidence.
+        self.clear_after = int(clear_after)
+        self.free_streak = np.zeros((self.n, self.n), np.uint8) if clear_after > 0 else None
+        # Lethal confirmation (needs clear_after > 0). 1 = off: one lethal sighting is
+        # remembered as lethal. N > 1: a cell must be SEEN lethal on N fusions before the
+        # memory calls it lethal; until then it is stored as UNCONFIRMED (expensive, never
+        # blocking). A monocular camera throws single-frame lethal specks - a puddle
+        # labelled water for one frame, a depth spike - and in max-fusion memory each one
+        # is permanent, gets inflated by a robot radius at plan time, and a 0.5 m trail
+        # sprinkled with them plans as a wall. The live local map is untouched: a real
+        # obstacle ahead is still lethal on the very first frame that sees it.
+        self.lethal_confirm = int(lethal_confirm)
+        self.lethal_hits = np.zeros((self.n, self.n), np.uint8) if (lethal_confirm > 1 and clear_after > 0) else None
+        self.holds_raw = False                      # set by Navigator.step(raw=...)
         self.version = 0
 
     def reset(self):
         self.grid[:] = UNKNOWN
+        if self.free_streak is not None:
+            self.free_streak[:] = 0
+        if self.lethal_hits is not None:
+            self.lethal_hits[:] = 0
         self.version += 1
 
     # -- coordinates ---------------------------------------------------------
@@ -226,10 +256,31 @@ class GlobalCostmap:
         # several local cells can land in one global cell: resolve by max
         flat = gx * self.n + gy
         order = np.argsort(flat, kind="stable")
-        flat_s, val_s = flat[order], np.maximum(cur[order], val[order])
-        uniq, start = np.unique(flat_s, return_index=True)
-        maxes = np.maximum.reduceat(val_s, start)
-        self.grid.reshape(-1)[uniq] = maxes
+        if self.free_streak is None:
+            flat_s, val_s = flat[order], np.maximum(cur[order], val[order])
+            uniq, start = np.unique(flat_s, return_index=True)
+            maxes = np.maximum.reduceat(val_s, start)
+            self.grid.reshape(-1)[uniq] = maxes
+        else:
+            flat_s, obs_s = flat[order], val[order]
+            uniq, start = np.unique(flat_s, return_index=True)
+            obs = np.maximum.reduceat(obs_s, start)            # this frame, per global cell
+            obs_seen = obs                                      # what the camera reported
+            if self.lethal_hits is not None:
+                hits = self.lethal_hits.reshape(-1)
+                seen_lethal = (obs >= LETHAL) & (obs != UNKNOWN)
+                hits[uniq] = np.where(seen_lethal, np.minimum(hits[uniq].astype(np.int32) + 1, 255), hits[uniq])
+                obs = np.where(seen_lethal & (hits[uniq] < self.lethal_confirm), UNCONFIRMED, obs).astype(obs.dtype)
+            prev = self.grid.reshape(-1)[uniq]
+            prev = np.where(prev == UNKNOWN, 0, prev).astype(np.uint8)
+            streak = self.free_streak.reshape(-1)
+            free = obs_seen < LETHAL - 1                        # not lethal, not inscribed (as SEEN:
+                                                                # an unconfirmed sighting is not free ground)
+            streak[uniq] = np.where(free, np.minimum(streak[uniq].astype(np.int32) + 1, 255), 0)
+            cleared = streak[uniq] >= self.clear_after
+            if self.lethal_hits is not None:
+                hits[uniq] = np.where(cleared, 0, hits[uniq])      # cleared ground starts over
+            self.grid.reshape(-1)[uniq] = np.where(cleared, obs, np.maximum(prev, obs))
         self.version += 1
 
     # -- planning copies ------------------------------------------------------
@@ -313,14 +364,20 @@ class PlannerCfg:
     pool: int = 2                       # plan at res * pool
     margin_m: float = 15.0              # box around start/goal
     robot_radius: float = 0.8
+    algo: str = "astar"                 # "astar" (replan from scratch) | "dstar" (D* Lite, incremental)
 
 
-def plan_global(gmap: GlobalCostmap, pose: Pose, goal, pcfg: PlannerCfg = PlannerCfg()):
+class _InflateCfg:
+    """The four fields perception_core.inflate() reads."""
+    def __init__(self, res: float, robot_radius: float):
+        self.res, self.robot_radius, self.LETHAL, self.UNKNOWN = res, robot_radius, LETHAL, UNKNOWN
+
+
+def _planning_grid(gmap: GlobalCostmap, pose: Pose, goal, pcfg: PlannerCfg, box=None):
     """
-    A* on a coarse, boxed copy of the global map. Returns (path_world, reached).
-
-    The full 480x480 map takes ~0.5 s in pure Python; a 2x pooled copy boxed
-    around start and goal with a 15 m margin is <= 200x200 and ~80 ms worst case.
+    The coarse, boxed grid both global planners search, with the two fix-ups applied.
+    `box` = (x0, x1, y0, y1) in pooled cells; None boxes start and goal with the margin.
+    Returns (sub, (x0, y0), res, start, goal) with start/goal in sub-grid cells.
     """
     res = gmap.res * pcfg.pool
     g = gmap.pooled(pcfg.pool)
@@ -332,10 +389,17 @@ def plan_global(gmap: GlobalCostmap, pose: Pose, goal, pcfg: PlannerCfg = Planne
 
     sx, sy = cell(pose.x, pose.y)
     gx, gy = cell(goal[0], goal[1])
-    m = int(math.ceil(pcfg.margin_m / res))
-    x0, x1 = max(0, min(sx, gx) - m), min(n, max(sx, gx) + m + 1)
-    y0, y1 = max(0, min(sy, gy) - m), min(n, max(sy, gy) + m + 1)
+    if box is None:
+        m = int(math.ceil(pcfg.margin_m / res))
+        x0, x1 = max(0, min(sx, gx) - m), min(n, max(sx, gx) + m + 1)
+        y0, y1 = max(0, min(sy, gy) - m), min(n, max(sy, gy) + m + 1)
+    else:
+        x0, x1, y0, y1 = box
     sub = g[x0:x1, y0:y1].copy()
+    if getattr(gmap, "holds_raw", False):
+        # the memory holds raw obstacles (see Navigator.step): inflate the planning copy,
+        # at the planning resolution, so the global path keeps a robot radius of clearance
+        sub = inflate(sub, _InflateCfg(res, pcfg.robot_radius))
 
     # the robot is standing here, so here is drivable whatever the fusion smear says
     r = int(math.ceil(pcfg.robot_radius / res))
@@ -348,12 +412,80 @@ def plan_global(gmap: GlobalCostmap, pose: Pose, goal, pcfg: PlannerCfg = Planne
                 if sub[lx + dx, ly + dy] >= 253 and sub[lx + dx, ly + dy] != UNKNOWN:
                     sub[lx + dx, ly + dy] = 100
     # a goal placed on an obstacle is still a direction to head in
-    if sub[gx - x0, gy - y0] == LETHAL:
+    if 0 <= gx - x0 < sub.shape[0] and 0 <= gy - y0 < sub.shape[1] and sub[gx - x0, gy - y0] == LETHAL:
         sub[gx - x0, gy - y0] = 253
+    return sub, (x0, y0), res, (lx, ly), (gx - x0, gy - y0)
 
-    path, reached = astar(sub, pcfg, start=(lx, ly), goal=(gx - x0, gy - y0))
+
+def plan_global(gmap: GlobalCostmap, pose: Pose, goal, pcfg: PlannerCfg = PlannerCfg()):
+    """
+    A* on a coarse, boxed copy of the global map. Returns (path_world, reached).
+
+    The full 480x480 map takes ~0.5 s in pure Python; a 2x pooled copy boxed
+    around start and goal with a 15 m margin is <= 200x200 and ~80 ms worst case.
+    """
+    sub, (x0, y0), res, start, goal_c = _planning_grid(gmap, pose, goal, pcfg)
+    path, reached = astar(sub, pcfg, start=start, goal=goal_c)
     world = [(gmap.origin + (ix + x0 + 0.5) * res, gmap.origin + (iy + y0 + 0.5) * res) for ix, iy in path]
     return world, reached
+
+
+class DStarGlobalPlanner:
+    """
+    Global planning with D* Lite (see `dstar_lite.py`): same grid, same costs and same
+    return value as `plan_global`, but the search is KEPT between replans and repaired
+    where the map changed, instead of redone from scratch.
+
+    D* Lite needs a fixed graph, so the box is frozen when a goal is set (start and goal
+    plus the margin, like A*'s) and rebuilt only if the robot leaves it or the goal
+    changes. An unreachable goal falls back to A* for that replan, which returns the
+    path to the closest reachable cell - D* Lite has no equivalent answer.
+    """
+
+    def __init__(self, pcfg: PlannerCfg):
+        self.pcfg = pcfg
+        self.reset()
+
+    def reset(self):
+        self.ds = None
+        self.goal = None
+        self.box = None
+        self.origin_cell = (0, 0)
+        self.last_changed = 0
+        self.fallbacks = 0
+
+    def _cost(self, sub):
+        from costmap_prototype import traversal_cost
+        return traversal_cost(sub, self.pcfg)
+
+    def plan(self, gmap: GlobalCostmap, pose: Pose, goal):
+        from dstar_lite import DStarLite
+        pcfg = self.pcfg
+        res = gmap.res * pcfg.pool
+        n = gmap.n // pcfg.pool
+        sx = int(np.clip(np.floor((pose.x - gmap.origin) / res), 0, n - 1))
+        sy = int(np.clip(np.floor((pose.y - gmap.origin) / res), 0, n - 1))
+        inside = (self.box is not None and self.box[0] <= sx < self.box[1]
+                  and self.box[2] <= sy < self.box[3])
+        if self.ds is None or goal != self.goal or not inside:
+            sub, (x0, y0), res, start, goal_c = _planning_grid(gmap, pose, goal, pcfg)
+            self.box = (x0, x0 + sub.shape[0], y0, y0 + sub.shape[1])
+            self.origin_cell, self.goal = (x0, y0), goal
+            cost, blocked = self._cost(sub)
+            self.ds = DStarLite(sub.shape, goal_c, cost, blocked, pcfg.plan_cost_weight)
+            self.last_changed = sub.size
+        else:
+            sub, (x0, y0), res, start, goal_c = _planning_grid(gmap, pose, goal, pcfg, box=self.box)
+            cost, blocked = self._cost(sub)
+            self.last_changed = self.ds.update_costs(cost, blocked, start)
+
+        path = self.ds.plan(start)
+        reached = True
+        if path is None:
+            self.fallbacks += 1
+            path, reached = astar(sub, pcfg, start=start, goal=goal_c)
+        world = [(gmap.origin + (ix + x0 + 0.5) * res, gmap.origin + (iy + y0 + 0.5) * res) for ix, iy in path]
+        return world, reached
 
 
 def path_blocked(gmap: GlobalCostmap, path_world, pcfg: PlannerCfg = PlannerCfg()) -> bool:
@@ -439,7 +571,22 @@ class NavCfg:
     stop_dist: float = 0.7
     turn_slow: float = 0.6
     cmd_smooth: float = 0.5        # EMA on omega between frames (0 = off)
+    inscribed_blocks: bool = True  # local planner: the 253 skirt is a collision, not a squeeze
     accel_max: float = 1.5         # m/s per second, ramps v instead of stepping it
+    # Unknown-path gate. UNKNOWN is passable for the planner (it must be, or a monocular
+    # robot never moves), which means a frame whose map came out empty - a lost plane,
+    # a depth model off its scale - produced a full-speed plan straight through it.
+    # Look at the first `unknown_gate_m` of the chosen path: this fraction UNKNOWN or
+    # more -> half speed, `unknown_stop` or more -> BLOCKED. Off by default: the sim's
+    # true depth never needs it, and its tuned runs must not change.
+    unknown_gate: bool = False
+    unknown_gate_m: float = 1.5
+    unknown_slow: float = 0.3
+    unknown_stop: float = 0.6
+    # Starting inside the 253 skirt means the body is already within a radius of an
+    # obstacle; astar only opens a way OUT, but leaving at cruise speed is how a noisy
+    # frame turns into a scrape. None = no cap (the sim's tuned default).
+    escape_v: Optional[float] = None
     LETHAL: int = LETHAL
     UNKNOWN: int = UNKNOWN
 
@@ -453,6 +600,7 @@ class _LocalCfg:
         self.lookahead, self.stop_dist, self.v_max, self.w_max, self.turn_slow = (
             ncfg.lookahead, ncfg.stop_dist, ncfg.v_max, ncfg.w_max, ncfg.turn_slow)
         self.LETHAL, self.UNKNOWN = LETHAL, UNKNOWN
+        self.inscribed_blocks, self.robot_radius = ncfg.inscribed_blocks, cfg.robot_radius
 
 
 def local_goal_cell(cfg: CoreCfg, rx, ry):
@@ -485,6 +633,7 @@ class Navigator:
     TURNING   : carrot is behind/beside -> rotate in place toward it
     DRIVING   : local A* to the carrot + pure pursuit
     BLOCKED   : local planner found no safe first step -> stop, then spin recovery
+    LOST      : a global map is in use but the pose is unavailable -> stop and wait
     ARRIVED   : within goal_tol of the goal -> stop until a new goal
     """
 
@@ -492,6 +641,7 @@ class Navigator:
                  pcfg: PlannerCfg = PlannerCfg()):
         self.cfg, self.ncfg, self.pcfg = cfg, ncfg, pcfg
         self.gmap = gmap
+        self.dstar = DStarGlobalPlanner(pcfg) if pcfg.algo == "dstar" else None
         self.goal = None
         self.state = "NO_GOAL"
         self.global_path: list = []
@@ -508,6 +658,8 @@ class Navigator:
     # -- goal management ------------------------------------------------------
     def set_goal(self, x, y):
         self.goal = (float(x), float(y))
+        if self.dstar is not None:
+            self.dstar.reset()
         self.state = "PLANNING"
         self.global_path, self.global_reached = [], None
         self._last_plan_t = -1e9
@@ -523,6 +675,8 @@ class Navigator:
         self.clear_goal()
         if self.gmap is not None:
             self.gmap.reset()
+        if self.dstar is not None:
+            self.dstar.reset()
 
     def watchdog(self, now: Optional[float] = None) -> bool:
         """True if no frame has arrived within ncfg.watchdog seconds."""
@@ -530,18 +684,46 @@ class Navigator:
         return (now - self._last_frame_t) > self.ncfg.watchdog
 
     # -- one cycle -----------------------------------------------------------
-    def step(self, local_grid: np.ndarray, pose: Optional[Pose], now: Optional[float] = None) -> NavOutput:
+    def step(self, local_grid: np.ndarray, pose: Optional[Pose], now: Optional[float] = None,
+             raw: Optional[np.ndarray] = None) -> NavOutput:
+        """
+        `local_grid` is this frame's INFLATED costmap. Pass `raw` (the same grid before
+        inflation, `CoreResult.raw`) and the memory stores raw obstacles instead: fused
+        and backfilled raw, then the combined planning grid is inflated once. Fusing
+        inflated grids makes every noisy detection's 1-robot-radius skirt permanent, and
+        re-observing it from a slightly different place widens it - after a while the
+        map around a rock field is all skirt and nothing passes.
+        """
         now = time.monotonic() if now is None else now
         self._last_frame_t = now
         cfg, ncfg = self.cfg, self.ncfg
 
         if self.gmap is not None and pose is not None:
-            self.gmap.fuse(local_grid, cfg, pose)
-            local_grid = fill_unknown_from_global(local_grid, self.gmap, cfg, pose)
+            if raw is not None:
+                self.gmap.holds_raw = True
+                self.gmap.fuse(raw, cfg, pose)
+                local_grid = inflate(fill_unknown_from_global(raw, self.gmap, cfg, pose), cfg)
+            else:
+                self.gmap.fuse(local_grid, cfg, pose)
+                local_grid = fill_unknown_from_global(local_grid, self.gmap, cfg, pose)
+        self.last_plan_grid = local_grid          # exactly what the local planner sees (recorder)
 
         if self.goal is None:
             self.state = "NO_GOAL"
             return NavOutput("NO_GOAL", 0.0, 0.0)
+
+        # A navigator WITH a global map was given a world-frame goal. Without a pose that
+        # goal cannot be put into the robot frame, and reading its coordinates as if they
+        # were robot-relative (the local-only branch below) sends the rover toward a
+        # point that has nothing to do with the goal - the wrong way entirely once it has
+        # turned. The only safe answer is to stop and wait for the pose to come back.
+        if self.gmap is not None and pose is None:
+            self.state = "LOST"
+            self._turning = False
+            self._v_prev, self._w_prev = 0.0, 0.0
+            self._blocked = self._recover = 0
+            return NavOutput("LOST", 0.0, 0.0, global_path=self.global_path,
+                             note="no pose - holding until odometry recovers")
 
         # ---- where is the goal, in the robot frame? ---------------------------
         if pose is not None:
@@ -559,7 +741,10 @@ class Navigator:
         if self.gmap is not None and pose is not None:
             due = (now - self._last_plan_t) >= ncfg.replan_period
             if due or not self.global_path or path_blocked(self.gmap, self.global_path, self.pcfg):
-                self.global_path, self.global_reached = plan_global(self.gmap, pose, self.goal, self.pcfg)
+                if self.dstar is not None:
+                    self.global_path, self.global_reached = self.dstar.plan(self.gmap, pose, self.goal)
+                else:
+                    self.global_path, self.global_reached = plan_global(self.gmap, pose, self.goal, self.pcfg)
                 self._last_plan_t = now
             cx, cy = carrot(self.global_path, pose, cfg, self.goal)
         else:
@@ -580,7 +765,9 @@ class Navigator:
         if self._turning:
             if abs(bearing) < exit_:
                 self._turning = False
-        elif cx < ncfg.turn_min_x or abs(bearing) > enter:
+        elif (cx < ncfg.turn_min_x and abs(bearing) > exit_) or abs(bearing) > enter:
+            # (a close carrot DEAD AHEAD is driven to, not turned toward: turning in place
+            # at omega = gain * 0 is a stall that never ends)
             self._turning = True
         if self._turning:
             self.state = "TURNING"
@@ -592,7 +779,25 @@ class Navigator:
         # ---- local layer: A* to the carrot, pure pursuit ------------------------
         lcfg = _LocalCfg(cfg, ncfg, lx, ly)
         path, reached = astar(local_grid, lcfg, goal=gcell)
-        if not path:
+        v = w = 0.0; aim = None
+        if len(path) >= 2:
+            v, w, aim = drive_command(path, lcfg)
+        if len(path) < 2 or (v == 0.0 and w == 0.0):
+            # No step to take: [] = lethal dead ahead; [start] = nothing reachable is any
+            # closer to the carrot; (0, 0) from pure pursuit = the reachable part of the
+            # plan ends inside stop_dist. All three used to fall through to DRIVING at
+            # v = 0, so recovery never ran and the rover sat still indefinitely while
+            # reporting that it was driving.
+            path = []
+            # The goal itself is inside a hazard's clearance (clicked next to a trench,
+            # on a rock): no safe cell is closer to it than where we already are, so this
+            # is as close as it gets. Arrive here rather than spin-recovering forever.
+            if inside_local(gx, gy, cfg) and local_grid[local_goal_cell(cfg, gx, gy)] in (LETHAL - 1, LETHAL):
+                self.state = "ARRIVED"
+                self._blocked = self._recover = 0
+                self._v_prev, self._w_prev = 0.0, 0.0
+                return NavOutput("ARRIVED", 0.0, 0.0, local_goal=gcell, global_path=self.global_path,
+                                 dist_to_goal=dist, note="goal is inside a hazard's clearance - closest safe point")
             self._blocked += 1
             if self._blocked > ncfg.blocked_frames:
                 self._recover += 1
@@ -609,7 +814,25 @@ class Navigator:
         self._blocked = 0
         self._recover = 0
 
-        v, w, aim = drive_command(path, lcfg)
+        # Safety caps are applied AFTER the accel ramp below: the ramp limits how fast the
+        # command may fall, and a cap it could lift is not a cap.
+        note, v_cap = "", None
+        if ncfg.unknown_gate:
+            n_gate = max(1, int(ncfg.unknown_gate_m / cfg.res))
+            ahead = [local_grid[c] for c in path[:n_gate]]
+            unk = sum(1 for c in ahead if c == UNKNOWN) / len(ahead)
+            if unk >= ncfg.unknown_stop:
+                self.state = "BLOCKED"
+                self._v_prev, self._w_prev = 0.0, 0.0
+                return NavOutput("BLOCKED", 0.0, 0.0, local_goal=gcell, global_path=self.global_path,
+                                 dist_to_goal=dist, note=f"path ahead {unk:.0%} unknown")
+            if unk >= ncfg.unknown_slow:
+                v_cap = 0.5 * v
+                note = f"slow: path ahead {unk:.0%} unknown"
+        if ncfg.escape_v is not None and local_grid[path[0]] == LETHAL - 1:
+            v_cap = ncfg.escape_v if v_cap is None else min(v_cap, ncfg.escape_v)
+            note = "crawl: leaving an obstacle's clearance"
+
         # slow into the goal
         if dist < ncfg.slow_dist:
             v *= max(0.25, dist / ncfg.slow_dist)
@@ -621,8 +844,10 @@ class Navigator:
             w = ncfg.cmd_smooth * self._w_prev + (1 - ncfg.cmd_smooth) * w
         dv = ncfg.accel_max * dt
         v = float(np.clip(v, self._v_prev - 2 * dv, self._v_prev + dv))
+        if v_cap is not None:
+            v = min(v, v_cap)
         self._v_prev, self._w_prev = v, w
         self.state = "DRIVING"
         return NavOutput("DRIVING", float(v), float(w), local_path=path,
                          local_path_m=path_metres(path, lcfg), local_goal=gcell, aim=aim,
-                         reached=reached, global_path=self.global_path, dist_to_goal=dist)
+                         reached=reached, global_path=self.global_path, dist_to_goal=dist, note=note)

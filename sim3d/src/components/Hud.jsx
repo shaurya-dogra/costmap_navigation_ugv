@@ -8,9 +8,10 @@ const box = {
   background: "rgba(10,12,18,0.72)", padding: "10px 12px", borderRadius: 8, backdropFilter: "blur(4px)",
 };
 const btn = (bg = "#4a7c59") => ({ background: bg, color: "#fff", border: "none", padding: "6px 10px", borderRadius: 4, cursor: "pointer", fontWeight: 600, fontSize: 12 });
-const statusColor = { DRIVING: "#4ade80", ARRIVED: "#38bdf8", BLOCKED: "#f87171", STOPPED: "#f87171", ERROR: "#f87171", TURNING: "#f59e0b", PLANNING: "#f59e0b", NO_GOAL: "#9ca3af" };
+const statusColor = { DRIVING: "#4ade80", ARRIVED: "#38bdf8", BLOCKED: "#f87171", LOST: "#f87171", STOPPED: "#f87171", ERROR: "#f87171", TURNING: "#f59e0b", PLANNING: "#f59e0b", NO_GOAL: "#9ca3af" };
 
-export default function Hud({ telemetry, cameraMode, setCameraMode, auto, setAuto, autoRef, collisions, pipRef, course }) {
+export default function Hud({ telemetry, cameraMode, setCameraMode, auto, setAuto, autoRef, collisions, pipRef, course, children,
+                             dropObstacle, clearDrops, nDrops = 0 }) {
   const st = useNav();
   const nav = st.nav;
   const [gx, setGx] = useState(String(course.goalPreset.navX));
@@ -18,6 +19,12 @@ export default function Hud({ telemetry, cameraMode, setCameraMode, auto, setAut
 
   const toggleAuto = () => { const n = !auto; autoRef.current = n; setAuto(n); link.setMode(n); };
   const setGoal = () => { const x = parseFloat(gx), y = parseFloat(gy); if (!isNaN(x) && !isNaN(y)) link.setGoalNav(x, y); };
+  const runAB = () => {                      // the demo mission: pad A -> pad B, in AUTO
+    const g = course.goalPreset;
+    setGx(g.navX.toFixed(1)); setGy(g.navY.toFixed(1));
+    if (!auto) toggleAuto();
+    link.setGoalNav(g.navX, g.navY);
+  };
   const clickGlobal = (ev) => {
     if (!nav || !nav.global || !nav.global.meta) return;
     const img = ev.currentTarget, r = img.getBoundingClientRect(), mt = nav.global.meta;
@@ -30,8 +37,12 @@ export default function Hud({ telemetry, cameraMode, setCameraMode, auto, setAut
 
   return (
     <>
-      {/* ---- left: controls + telemetry ------------------------------------------ */}
-      <div style={{ ...box, top: 16, left: 16, width: 300 }}>
+      {/* ---- left column: controls + telemetry, then the course map (children) ----
+           One flex column bounded by the viewport, so the two can never overlap: the
+           telemetry box scrolls when the window is short, the map keeps its size. */}
+      <div style={{ position: "absolute", top: 16, left: 16, bottom: 16, width: 324, zIndex: 10,
+                    display: "flex", flexDirection: "column", gap: 8, pointerEvents: "none" }}>
+      <div style={{ ...box, position: "relative", flex: "0 1 auto", minHeight: 120, overflowY: "auto", pointerEvents: "auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
           <strong>SLAM3D · autonomous rover</strong>
           <span style={{ color: st.connected ? "#4ade80" : "#f87171" }}>● {st.connected ? "perception" : "no server"}</span>
@@ -40,8 +51,13 @@ export default function Hud({ telemetry, cameraMode, setCameraMode, auto, setAut
           {nav ? nav.status : (st.connected ? "waiting for frames" : "offline")}
         </div>
         {nav && nav.note && <div style={{ color: "#9ca3af" }}>{nav.note}</div>}
-        <div style={{ margin: "6px 0" }}>
+        <div style={{ margin: "6px 0", display: "flex", gap: 6, flexWrap: "wrap" }}>
           <button style={btn(auto ? "#b45309" : "#1d4ed8")} onClick={toggleAuto}>{auto ? "AUTO ✓  (T → manual)" : "MANUAL  (T → auto)"}</button>
+          <button style={btn("#15803d")} onClick={runAB} title="drive itself from pad A to pad B">▶ Mission A → B</button>
+        </div>
+        <div style={{ margin: "0 0 6px", display: "flex", gap: 6, alignItems: "center" }}>
+          <button style={btn("#9a3412")} onClick={dropObstacle} title="drop a crate 6 m ahead of the rover">Drop obstacle (O)</button>
+          {nDrops > 0 && <button style={btn("#374151")} onClick={clearDrops}>Clear {nDrops}</button>}
         </div>
         <table style={{ width: "100%", borderCollapse: "collapse" }}><tbody>
           <tr><td style={td}>command</td><td>{nav && nav.cmd ? (nav.cmd.v > 0 ? `v ${nav.cmd.v.toFixed(2)} m/s  ω ${nav.cmd.omega >= 0 ? "+" : ""}${nav.cmd.omega.toFixed(2)}` : `STOP${nav.cmd.omega ? `  ω ${nav.cmd.omega.toFixed(2)}` : ""}`) : "–"}</td></tr>
@@ -77,9 +93,11 @@ export default function Hud({ telemetry, cameraMode, setCameraMode, auto, setAut
         </div>
         <div style={{ color: "#9ca3af", marginTop: 6 }}>WASD drive (takes over) · Space brake · T auto · click ground = goal · seed {course.seed}{gThree ? ` · goal three (${gThree.x.toFixed(0)}, ${gThree.z.toFixed(0)})` : ""}</div>
       </div>
+      {children}
+      </div>
 
       {/* ---- right: what the robot sees + maps ---------------------------------- */}
-      <div style={{ ...box, top: 16, right: 16, width: 336, padding: 8 }}>
+      <div style={{ ...box, top: 16, right: 16, width: 336, padding: 8, maxHeight: "calc(100vh - 32px)", overflowY: "auto", boxSizing: "border-box" }}>
         <div style={lbl}>robot camera (streamed)</div>
         <canvas ref={pipRef} width={320} height={180} style={{ width: 320, height: 180, display: "block", background: "#000", borderRadius: 4 }} />
         <div style={{ ...lbl, marginTop: 6 }}>local costmap · forward = up</div>

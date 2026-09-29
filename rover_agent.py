@@ -88,6 +88,62 @@ class FrameSlot:
             return item
 
 
+class GroundAE:
+    """Slow, ground-metered software auto-exposure. Pure logic: no camera in here.
+
+    Why not the ISP's own AE, and why not freeze it once at start-up (the earlier
+    behaviour): locking exposure after a 2 s settle is right on a bench, where the light
+    never changes, and wrong outdoors, where the rover drives from sun into a tree's
+    shade. The frame then goes dark or clips, and depth, semantics and the ground
+    odometry all fail on it together. The ISP's AE fixes that but has the opposite
+    problem: it meters the whole frame - bright sky included - and re-converges in a
+    few frames, so brightness jumps under the odometry's feature tracker.
+
+    This sits between the two:
+      * METERED ON THE GROUND ONLY - the lower `ground_frac` of the upright image, where
+        every downstream stage looks; the sky cannot drag the ground into darkness;
+      * SLEW-LIMITED - at most `max_step` change per adjustment, with a dead band, so
+        brightness drifts over seconds instead of stepping between frames;
+      * BLUR-AWARE - exposure time is capped at `max_exposure_us` (rolling shutter on a
+        rigid chassis smears badly on longer exposures) and gain makes up the rest.
+    """
+
+    def __init__(self, exposure_us: float, gain: float, target: float = 110.0,
+                 deadband: float = 0.12, max_step: float = 0.15,
+                 min_exposure_us: float = 100.0, max_exposure_us: float = 8000.0,
+                 min_gain: float = 1.0, max_gain: float = 8.0, ground_frac: float = 0.6):
+        self.target, self.deadband, self.max_step = target, deadband, max_step
+        self.min_exp, self.max_exp = min_exposure_us, max_exposure_us
+        self.min_gain, self.max_gain = min_gain, max_gain
+        self.ground_frac = ground_frac
+        self.exposure, self.gain = self._split(float(exposure_us) * float(gain))
+
+    def _split(self, total: float):
+        """exposure x gain -> (exposure, gain), preferring exposure up to the blur cap."""
+        total = float(np.clip(total, self.min_exp * self.min_gain, self.max_exp * self.max_gain))
+        exposure = float(np.clip(total / self.min_gain, self.min_exp, self.max_exp))
+        gain = float(np.clip(total / exposure, self.min_gain, self.max_gain))
+        return exposure, gain
+
+    def meter(self, bgr_upright: np.ndarray) -> float:
+        """Mean luma of the ground band of an UPRIGHT frame (subsampled; ~0.1 ms)."""
+        h = bgr_upright.shape[0]
+        band = bgr_upright[int(h * (1.0 - self.ground_frac))::4, ::4]
+        return float(cv2.cvtColor(band, cv2.COLOR_BGR2GRAY).mean())
+
+    def update(self, mean: float) -> Optional[dict]:
+        """Next controls for picamera2, or None when nothing should change."""
+        ratio = self.target / max(mean, 1.0)
+        if abs(ratio - 1.0) <= self.deadband:
+            return None
+        ratio = float(np.clip(ratio, 1.0 / (1.0 + self.max_step), 1.0 + self.max_step))
+        exposure, gain = self._split(self.exposure * self.gain * ratio)
+        if abs(exposure - self.exposure) < 1.0 and abs(gain - self.gain) < 1e-3:
+            return None                      # pinned at a limit: nothing left to change
+        self.exposure, self.gain = exposure, gain
+        return {"ExposureTime": int(round(exposure)), "AnalogueGain": float(gain)}
+
+
 class CameraThread(threading.Thread):
     """Owns the picamera2 handle; runs entirely off the asyncio event loop.
 
@@ -102,11 +158,14 @@ class CameraThread(threading.Thread):
     the only way to get the wide picture this rover needs to see obstacles to the side.
     """
 
-    def __init__(self, slot: FrameSlot, width: int, height: int, verbose: bool) -> None:
+    def __init__(self, slot: FrameSlot, width: int, height: int, verbose: bool,
+                 ae_mode: str = "ground", rotation: int = 0, ae_period: float = 0.5) -> None:
         super().__init__(daemon=True, name="camera")
         self.slot = slot
         self.width, self.height = width, height
         self.verbose = verbose
+        self.ae_mode, self.rotation, self.ae_period = ae_mode, int(rotation) % 360, ae_period
+        self.ae: Optional[GroundAE] = None
         self.stop_flag = threading.Event()
         self.picam2 = None  # set in run(); read back by main() for clean shutdown
 
@@ -125,11 +184,12 @@ class CameraThread(threading.Thread):
         picam2.configure(cfg)
         picam2.start()
 
-        # Let AE/AWB converge against the real scene, then freeze them. Re-running AE
-        # mid-mission would silently shift brightness/white-balance frame to frame,
-        # which is exactly the kind of appearance drift the depth/costmap pipeline on
-        # the Mac assumes does not happen. The IMX219 module has no autofocus at all,
-        # so there is nothing to lock there - fixed focus is a property of the lens.
+        # Let AE/AWB converge against the real scene, then take them over. White
+        # balance stays frozen (a colour shift mid-run changes what the segmenter sees
+        # for no benefit). Exposure is frozen too with `--ae locked` (bench), and
+        # otherwise handed to GroundAE: slow, ground-metered, blur-capped - see there
+        # for why neither a one-off lock nor the ISP's own AE survives outdoors. The
+        # IMX219 module has no autofocus at all, so there is nothing to lock there.
         time.sleep(2.0)
         settled = picam2.capture_metadata()
         exposure = settled.get("ExposureTime")
@@ -142,10 +202,16 @@ class CameraThread(threading.Thread):
             controls["AnalogueGain"] = gain
         if colour_gains is not None:
             controls["ColourGains"] = colour_gains
+        if self.ae_mode == "ground" and exposure is not None and gain is not None:
+            self.ae = GroundAE(exposure, gain)
+            controls["ExposureTime"] = int(round(self.ae.exposure))
+            controls["AnalogueGain"] = float(self.ae.gain)
         picam2.set_controls(controls)
         if self.verbose:
-            print(f"[camera] locked AE/AWB: exposure={exposure} gain={gain} "
+            print(f"[camera] AE={'ground' if self.ae else 'locked'} AWB=locked: exposure="
+                  f"{controls.get('ExposureTime')} gain={controls.get('AnalogueGain')} "
                   f"colour_gains={colour_gains}", file=sys.stderr)
+        next_ae = time.monotonic() + self.ae_period
 
         while not self.stop_flag.is_set():
             # capture_array() blocks this thread only, never the event loop - that is
@@ -158,6 +224,17 @@ class CameraThread(threading.Thread):
             # taking the array as-is, versus 20.5 after an RGB2BGR call.
             bgr = picam2.capture_array("main")
             self.slot.put(bgr, time.time())
+            if self.ae is not None and time.monotonic() >= next_ae:
+                next_ae = time.monotonic() + self.ae_period
+                small = cv2.resize(bgr, (bgr.shape[1] // 4, bgr.shape[0] // 4),
+                                   interpolation=cv2.INTER_AREA)
+                if self.rotation:      # meter the ground of the UPRIGHT image
+                    small = np.ascontiguousarray(np.rot90(small, k=-(self.rotation // 90)))
+                change = self.ae.update(self.ae.meter(small))
+                if change is not None:
+                    picam2.set_controls(change)
+                    if self.verbose:
+                        print(f"[camera] AE -> {change}", file=sys.stderr)
 
         picam2.stop()
         picam2.close()
@@ -248,7 +325,8 @@ class RoverAgent:
     # -- lifecycle ------------------------------------------------------------------
 
     def start_camera(self) -> None:
-        self.camera = CameraThread(self.slot, self.args.width, self.args.height, self.args.verbose)
+        self.camera = CameraThread(self.slot, self.args.width, self.args.height, self.args.verbose,
+                                   ae_mode=self.args.ae, rotation=self.args.rotation)
         self.camera.start()
 
     def stop_camera(self) -> None:
@@ -449,6 +527,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--rotation", type=int, default=0, choices=[0, 90, 180, 270],
                    help="rotate the frame upright before sending, for a camera bolted on "
                         "its side. Intrinsics are transformed to match. Remounting is better.")
+    ap.add_argument("--ae", default="ground", choices=["ground", "locked"],
+                   help="'ground' (default): slow auto-exposure metered on the ground band, "
+                        "blur-capped; 'locked': freeze exposure after start-up (bench only)")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
 

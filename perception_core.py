@@ -119,6 +119,14 @@ class CoreCfg:
     plane_jump_conf: float = 0.60   # ...namely at least this inlier ratio
     plane_hold_frames: int = 5      # hold the last plane this long, then relock
     plane_low_conf: float = 0.30    # below this the estimate is flagged
+    # (lo, hi) camera heights this rig can physically have. A fitted plane outside it is
+    # not a measurement of the ground (a metric depth model trained at car height reads
+    # a 10 cm FPV camera as 2.5 m up) and the map is reported UNKNOWN. None keeps the
+    # old behaviour: a warning outside 0.05-3.0 m, and the map is built anyway.
+    plane_plausible: Optional[tuple] = None
+    # (h, w) bool, True = the vehicle's own body in frame. Ground behind it is OCCLUDED,
+    # not a hole: the hole rule skips cells whose ground projects onto the mask.
+    ego_mask: Optional[np.ndarray] = None
 
     # --- optional locks: None = estimate ------------------------------------
     lock_height: Optional[float] = None
@@ -231,6 +239,10 @@ RIG_PRESETS = {
     # lens throws away the range resolution the low mount already made scarce. 60 deg
     # still spans +/-1.4 m at 2.5 m, far more than a 0.25 m chassis needs.
     "rover":   dict(hfov=60.0),
+    # ESP32-S3 camera boards (OV2640/OV3660, stock ~66 deg DIAGONAL lens -> ~55 deg
+    # horizontal; wide-lens variants are closer to 100). 4:3 sensor modes, so the
+    # processing frame keeps 4:3 instead of stretching to 16:9.
+    "esp32":   dict(hfov=56.0, aspect=4 / 3),
 }
 
 
@@ -824,7 +836,27 @@ def to_ground_frame(Xc, Yc, Zc, plane: Plane):
 # 5. the costmap
 # ----------------------------------------------------------------------------
 
-def build_costmap(X, Y, Z, sem_cost, valid, cfg: CoreCfg, cam_height: float = 0.6) -> np.ndarray:
+def ego_occluded_cells(cfg: CoreCfg, plane: "Plane") -> Optional[np.ndarray]:
+    """(nx, ny) bool: cells whose ground point projects onto cfg.ego_mask (or behind the
+    camera), i.e. ground the vehicle's own body hides. None without a mask."""
+    if cfg.ego_mask is None:
+        return None
+    xs = cfg.x_min + (np.arange(cfg.nx) + 0.5) * cfg.res
+    ys = cfg.y_min + (np.arange(cfg.ny) + 0.5) * cfg.res
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    P = np.stack([X, Y, np.full_like(X, -plane.d)], -1) @ plane.R        # R^T (p - d z)
+    z = P[..., 2]
+    u = np.round(cfg.fx * P[..., 0] / np.maximum(z, 1e-6) + cfg.cx).astype(np.int64)
+    v = np.round(cfg.fy * P[..., 1] / np.maximum(z, 1e-6) + cfg.cy).astype(np.int64)
+    m = cfg.ego_mask
+    inb = (z > 0) & (u >= 0) & (u < m.shape[1]) & (v >= 0) & (v < m.shape[0])
+    occ = z <= 0
+    occ[inb] = m[v[inb], u[inb]]
+    return cv2.dilate(occ.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+
+
+def build_costmap(X, Y, Z, sem_cost, valid, cfg: CoreCfg, cam_height: float = 0.6,
+                  inflated: bool = True, occluded: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Robot-frame points -> (nx, ny) uint8 grid.
 
@@ -911,6 +943,8 @@ def build_costmap(X, Y, Z, sem_cost, valid, cfg: CoreCfg, cam_height: float = 0.
         ahead = np.maximum.accumulate(any_pt[::-1], axis=0)[::-1]
         gap = (~any_pt) & behind & ahead
         gap[xmax_i:, :] = False
+        if occluded is not None:
+            gap &= ~occluded             # hidden by our own chassis: occluded, not a hole
         if gap.any():
             # index of the nearest measured cell behind each cell (forward fill)
             # anything lethal behind the gap, in this column or its neighbours,
@@ -941,7 +975,7 @@ def build_costmap(X, Y, Z, sem_cost, valid, cfg: CoreCfg, cam_height: float = 0.
                 ok_run = lengths[ids] >= min_len[starts[ids - 1], c]
                 keep[col, c] = ok_run
             grid[keep] = cfg.LETHAL
-    return inflate(grid, cfg)
+    return inflate(grid, cfg) if inflated else grid
 
 
 def inflate(grid: np.ndarray, cfg: CoreCfg) -> np.ndarray:
@@ -977,6 +1011,7 @@ class CoreResult:
     warnings: list = field(default_factory=list)
     depth_kind: str = "metric"
     affine: Optional[dict] = None      # solve_affine_depth() diagnostics, when used
+    raw: Optional[np.ndarray] = None   # `grid` BEFORE inflation: what a map should remember
 
 
 class PerceptionCore:
@@ -1071,19 +1106,28 @@ class PerceptionCore:
             grid = np.full((cfg.nx, cfg.ny), cfg.UNKNOWN, np.uint8)
             warnings.append("ground plane lost: map is UNKNOWN")
             return CoreResult(grid=grid, plane=plane, scale=scale, n_points=int(valid.sum()),
-                              warnings=warnings, depth_kind=depth_kind, affine=affine_info,
+                              warnings=warnings, depth_kind=depth_kind, affine=affine_info, raw=grid,
                               timing_ms=dict(backproject=(t1 - t0) * 1e3, plane=(t2 - t1) * 1e3, costmap=0.0))
 
         if plane.confidence < cfg.plane_low_conf:
             warnings.append(f"low ground-plane confidence {plane.confidence:.2f}")
+        if cfg.plane_plausible is not None and not (cfg.plane_plausible[0] <= plane.height <= cfg.plane_plausible[1]):
+            grid = np.full((cfg.nx, cfg.ny), cfg.UNKNOWN, np.uint8)
+            warnings.append(f"implausible camera height {plane.height:.2f} m "
+                            f"(rig {cfg.plane_plausible[0]:.2f}-{cfg.plane_plausible[1]:.2f}): map is UNKNOWN")
+            return CoreResult(grid=grid, plane=plane, scale=scale, n_points=int(valid.sum()),
+                              warnings=warnings, depth_kind=depth_kind, affine=affine_info, raw=grid,
+                              timing_ms=dict(backproject=(t1 - t0) * 1e3, plane=(t2 - t1) * 1e3, costmap=0.0))
         if not (0.05 <= plane.height <= 3.0):
             warnings.append(f"implausible camera height {plane.height:.2f} m")
 
         X, Y, Z = to_ground_frame(Xc, Yc, Zc, plane)
-        grid = build_costmap(X, Y, Z, sc, valid, cfg, cam_height=plane.height)
+        raw = build_costmap(X, Y, Z, sc, valid, cfg, cam_height=plane.height, inflated=False,
+                            occluded=ego_occluded_cells(cfg, plane))
+        grid = inflate(raw, cfg)
         t3 = time.perf_counter()
         return CoreResult(grid=grid, plane=plane, scale=scale, n_points=int(valid.sum()),
-                          warnings=warnings, depth_kind=depth_kind, affine=affine_info,
+                          warnings=warnings, depth_kind=depth_kind, affine=affine_info, raw=raw,
                           timing_ms=dict(backproject=(t1 - t0) * 1e3, plane=(t2 - t1) * 1e3,
                                          costmap=(t3 - t2) * 1e3))
 

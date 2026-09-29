@@ -101,6 +101,9 @@ class NavLink {
   clearGoal() { this.send({ type: "clear_goal" }); }
   setMode(auto) { this.state.mode = auto ? "auto" : "manual"; this.send({ type: "set_mode", auto }); this.emit(); }
   resetMap() { this.send({ type: "reset" }); }
+  // ground-truth contact -> server flight record. `type` is the MESSAGE type, so the
+  // hit's own `type` (rock, ditch, ...) travels as `hazard`.
+  reportEvent(ev) { const { type: hazard, ...rest } = ev; this.send({ ...rest, hazard, type: "event" }); }
   setDepth(mode) { this.send({ type: "set_depth", mode }); }
 
   subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }

@@ -4,6 +4,8 @@
 #   ./run_webcam.sh                  # MacBook camera (index 0), metric depth
 #   ./run_webcam.sh --source 1       # another camera index or a video file
 #   ./run_webcam.sh --hfov 70        # if you know the camera's horizontal FOV
+#   ./run_webcam.sh --source http://10.101.22.225:81/stream --rig esp32 --depth metric-indoor
+#                                    # ESP32-S3 cam over Wi-Fi (falls back to /capture if the stream is busy)
 #   ./run_webcam.sh --windows        # also show OpenCV windows
 #
 # Put the laptop on the ground with the lid at ~90 degrees. Camera height, pitch

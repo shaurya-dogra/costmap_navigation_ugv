@@ -112,7 +112,7 @@ export default function Vehicle({ setTelemetry, cameraMode, setCameraMode, setAu
     };
 
     // ground-truth scoring (the costmap never sees this)
-    const hits = groundTruthHits(carPos.x, carPos.z, carPos.y, course, NAV.rover.radius);
+    const hits = groundTruthHits(carPos.x, carPos.z, carPos.y, course, NAV.rover.radius, speedVal > 0.2);
     const ids = new Set(hits.map((h) => h.id));
     for (const h of hits) if (!activeHits.current.has(h.id)) onCollision?.(h);
     activeHits.current = ids;

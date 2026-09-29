@@ -42,6 +42,14 @@ No GPS. No LiDAR. The camera's height, pitch and roll are *measured every frame*
 </tr>
 </table>
 
+### 🎮 Closed loop in the 3D simulation
+
+<div align="center">
+<img src="docs/media/sim.gif" width="92%" alt="Simulated rover driving itself along a trail, weaving past boulders and a fallen tree, with the live costmap on the right">
+</div>
+
+*The rover drives itself from A to B on a 130 m course (React Three Fiber + Rapier physics), streaming its camera to the same perception server and driving on the `(v, ω)` it gets back. Boulders and the fallen tree appear as lethal blobs in the local costmap (right), and the plan bends around them. Top left, the camera pose is **measured** from the ground plane (h 1.010 m, pitch 15.4°) next to the true mount (1 m, 15°), with the collision count checked against ground truth.*
+
 ## 🖼️ The pipeline, stage by stage
 
 <table>
